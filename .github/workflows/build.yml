@@ -161,15 +161,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s globstar nullglob
           mkdir -p artifacts
           found=0
-          for f in src-tauri/target/**/bundle/dmg/*.dmg; do
+          # macOS runners ship bash 3.2 (no globstar), so collect with find.
+          while IFS= read -r -d '' f; do
             cp "$f" artifacts/; found=1
-          done
-          for f in src-tauri/target/**/bundle/macos/*.app; do
+          done < <(find src-tauri/target -path '*/bundle/dmg/*.dmg' -print0)
+          while IFS= read -r -d '' f; do
             ditto -c -k --sequesterRsrc --keepParent "$f" "artifacts/$(basename "$f").zip"; found=1
-          done
+          done < <(find src-tauri/target -path '*/bundle/macos/*.app' -print0)
           [ "$found" -eq 1 ] || { echo "No macOS .dmg/.app was produced"; exit 1; }
           ls -la artifacts
 
@@ -178,13 +178,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s globstar nullglob
           mkdir -p artifacts
           found=0
-          for f in src-tauri/target/**/bundle/deb/*.deb src-tauri/target/**/bundle/appimage/*.AppImage; do
+          # find-based collection: identical to the macOS step, no globstar.
+          while IFS= read -r -d '' f; do
             chmod +x "$f" 2>/dev/null || true
             cp "$f" artifacts/; found=1
-          done
+          done < <(find src-tauri/target \( -path '*/bundle/deb/*.deb' -o -path '*/bundle/appimage/*.AppImage' \) -print0)
           [ "$found" -eq 1 ] || { echo "No Linux .deb/.AppImage was produced"; exit 1; }
           ls -la artifacts
 

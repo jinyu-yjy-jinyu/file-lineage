@@ -15,8 +15,9 @@ use std::process;
 
 use rusqlite::{Connection, OpenFlags};
 
+use crate::downloaders::{self, Downloaders};
 use crate::im_layout;
-use crate::util::path_key;
+use crate::util::{format_ms, path_key};
 use crate::zoneid;
 use crate::SourceInfo;
 
@@ -45,12 +46,18 @@ struct Download {
 #[derive(Debug, Default)]
 pub struct Sources {
     downloads: Vec<Download>,
+    /// Third-party downloader task logs (Ghost Downloader, …).
+    pub downloaders: Downloaders,
     adapters: Vec<String>,
 }
 
 impl Sources {
     pub fn load() -> Self {
         let mut this = Sources::default();
+        this.downloaders = Downloaders::load();
+        if let Some(label) = &this.downloaders.adapter_label {
+            this.adapters.push(label.clone());
+        }
         this.load_chromium();
         this.load_firefox();
         this
@@ -61,7 +68,7 @@ impl Sources {
     }
 
     pub fn record_count(&self) -> usize {
-        self.downloads.len()
+        self.downloads.len() + self.downloaders.records().len()
     }
 
     fn load_chromium(&mut self) {
@@ -379,10 +386,13 @@ fn hex(c: u8) -> Option<u8> {
 /// Order matters and is the whole point of V2's source work:
 ///   1. `Zone.Identifier` — written by the downloader itself, browser
 ///      independent, survives cleared history, names the real origin host;
-///   2. browser download databases — gives page context and timestamps;
-///   3. IM receive-tree layout — names the account and the receive month;
-///   4. mail-ish file extensions;
-///   5. plain path shape.
+///   2. **third-party downloader task logs** — exact URL, tool name and
+///      timestamp, and the only evidence that works for files downloaded
+///      before this app was installed;
+///   3. browser download databases — gives page context and timestamps;
+///   4. IM receive-tree layout — names the account and the receive month;
+///   5. mail-ish file extensions;
+///   6. plain path shape.
 pub fn resolve(sources: &Sources, path: &str, name: &str, size: i64) -> SourceInfo {
     if let Some(zone) = zoneid::read(path) {
         let origin = zone.origin();
@@ -399,6 +409,44 @@ pub fn resolve(sources: &Sources, path: &str, name: &str, size: i64) -> SourceIn
             parts.push(format!("来源页面：{}", zone.referrer));
         }
         parts.push("证据：文件 Zone.Identifier 备用数据流（写入方标记，与浏览器无关）".to_string());
+        return SourceInfo {
+            kind: "download".to_string(),
+            label: headline,
+            detail: Some(parts.join("\n")),
+        };
+    }
+
+    // Third-party downloaders (Ghost Downloader / Motrix / IDM / …) do not
+    // write Zone.Identifier and never appear in browser history. Their own
+    // task log is the only place that says "who fetched this, from where,
+    // and when". Insert it before browser records so a precise task match wins.
+    if let Some(task) = sources.downloaders.lookup(path, name, size) {
+        let host = clean_url(&task.url);
+        let headline = if host.is_empty() {
+            format!("{} 下载", task.vendor)
+        } else {
+            format!("{} 下载 · {}", task.vendor, host)
+        };
+        let mut parts = vec![format!("产生方式：由 {} 从网络下载并写入", task.vendor)];
+        if !task.url.is_empty() {
+            parts.push(format!(
+                "下载地址：{}",
+                downloaders::truncate(&task.url, 240)
+            ));
+        }
+        if !task.referer.is_empty() {
+            parts.push(format!("来源页面：{}", task.referer));
+        }
+        if task.timestamp() > 0 {
+            parts.push(format!("下载完成：{}", format_ms(task.timestamp())));
+        }
+        if !task.task_id.is_empty() {
+            parts.push(format!("任务 ID：{}", task.task_id));
+        }
+        parts.push(format!(
+            "证据：{} 任务记录 tasks.jsonl（只读）",
+            task.vendor
+        ));
         return SourceInfo {
             kind: "download".to_string(),
             label: headline,
@@ -465,8 +513,10 @@ pub fn classify_path(path: &str) -> SourceInfo {
     } else if low.contains("\\downloads\\") || low.contains("\\下载\\") {
         (
             "download",
-            "下载目录",
-            "文件出现在系统下载目录，但未在浏览器下载记录中找到匹配条目。",
+            "下载目录（来源未确认）",
+            "文件位于下载目录，但没有匹配到 Zone.Identifier、下载器任务记录或浏览器下载记录。\
+常见原因：安装本应用之前就已下载、由未接入的下载器产生、或下载器的任务历史已被清理。\
+今后新下载的文件会在产生时记录进程与来源。",
         )
     } else if low.contains("\\desktop\\") || low.contains("\\桌面\\") {
         (

@@ -47,9 +47,11 @@ impl Attribution {
         }
     }
 
-    /// A usable answer needs at least a PID.
+    /// A usable answer needs at least a PID **or** a process name. The latter
+    /// comes from downloader task logs, which name the producing tool but
+    /// cannot know its (long gone) PID.
     pub fn is_usable(&self) -> bool {
-        self.pid.is_some()
+        self.pid.is_some() || self.process_name.is_some()
     }
 }
 

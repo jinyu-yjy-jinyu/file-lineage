@@ -164,7 +164,7 @@ export default function App() {
           ) : null}
         </div>
         <div className="topbar-actions">
-          <span className="version-tag">v0.1.0</span>
+          <span className="version-tag">v0.2.2</span>
           <button className="btn" onClick={() => void onRescan()} disabled={rescanning}>
             {rescanning ? "重新扫描中…" : "重新扫描"}
           </button>
@@ -236,8 +236,14 @@ export default function App() {
             <p className="mono small break">{status.dbPath || "—"}</p>
             <p className="muted small">大小 {formatBytes(status.dbSize)} · SQLite WAL</p>
             <div className="v1-note">
-              <strong>V1 范围</strong>
-              <p>只监控下载 / 桌面 / 文档三个目录，只回答三个问题。不做标签、搜索、云同步、团队协作与 AI 摘要。</p>
+              <strong>监控范围 · V2.0.2</strong>
+              <p>
+                递归监控 下载 / 桌面 / 文档 三个目录（含子目录），回答「从哪来 / 谁改过 / 删了会不会丢」。
+              </p>
+              <p>
+                来源证据：下载器任务记录、Zone.Identifier、浏览器下载库、IM 接收目录、Shell 打开记录。
+                写入事件与进程归因从安装后开始积累。
+              </p>
             </div>
           </div>
         </aside>

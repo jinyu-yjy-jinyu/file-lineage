@@ -147,6 +147,7 @@ impl Collector {
                 me.reload_sources();
                 me.scan_once();
                 me.recent_backfill();
+                me.download_backfill();
             })
             .ok();
     }
@@ -366,6 +367,66 @@ impl Collector {
         }
     }
 
+    /// Backfill the timeline with downloader task records. This is what makes
+    /// files downloaded *before* installation answer "how was I produced":
+    /// the task log carries the tool, the URL and the completion time even
+    /// though we never observed the write.
+    fn download_backfill(&self) {
+        let records = match self.sources.lock() {
+            Ok(guard) => guard.downloaders.records().to_vec(),
+            Err(_) => return,
+        };
+        if records.is_empty() {
+            return;
+        }
+        let mut added = 0i64;
+        for record in records {
+            if !self.running.load(Ordering::Relaxed) {
+                return;
+            }
+            let ts = record.timestamp();
+            if ts <= 0 {
+                continue;
+            }
+            let mut ids = Vec::new();
+            if let Some(id) = self.store.id_for_path(&record.path) {
+                ids.push(id);
+            }
+            if ids.is_empty() {
+                for (id, _) in self.store.ids_by_name(&record.name) {
+                    ids.push(id);
+                }
+            }
+            let note = format!(
+                "由 {} 下载并写入本机。\n来源：{}\n任务：{}",
+                record.vendor,
+                crate::downloaders::truncate(&record.url, 220),
+                crate::downloaders::truncate(&record.task_id, 64)
+            );
+            for id in ids {
+                if self.store.record_download(id, ts, &note).unwrap_or(false) {
+                    added += 1;
+                }
+            }
+        }
+        if added > 0 {
+            let ts = now_ms();
+            self.update(|s| {
+                s.events_this_session += added;
+                s.last_event_at = ts;
+            });
+        }
+    }
+
+    /// Name of the downloader that produced this path, if a task log says so.
+    fn downloader_for(&self, path: &str, name: &str, size: i64) -> Option<String> {
+        let guard = self.sources.lock().ok()?;
+        guard
+            .downloaders
+            .lookup(path, name, size)
+            .map(|record| record.vendor.clone())
+    }
+
     // ------------------------------------------------------------- watching
 
     fn watch_loop(&self) {
@@ -514,7 +575,19 @@ impl Collector {
         if is_noise_file(&obs.name) {
             return;
         }
-        let probe = self.final_probe(path, probe);
+        let mut probe = self.final_probe(path, probe);
+        if probe.is_none() {
+            // A downloader task log names the producing tool even when the
+            // write handle is long gone (common for rename-on-completion).
+            if let Some(vendor) = self.downloader_for(&obs.path, &obs.name, obs.size) {
+                probe = Some(Attribution {
+                    process_name: Some(vendor),
+                    process_path: None,
+                    pid: None,
+                    method: "download-task".to_string(),
+                });
+            }
+        }
 
         let mut notes: Vec<String> = Vec::new();
         if let Some(text) = note {

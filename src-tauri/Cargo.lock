@@ -841,13 +841,14 @@ dependencies = [
 
 [[package]]
 name = "file-lineage"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "blake3",
  "ferrisetw",
  "notify",
  "rusqlite",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "walkdir",

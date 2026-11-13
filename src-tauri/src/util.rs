@@ -121,6 +121,23 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+/// Human-readable UTC timestamp for unix milliseconds.
+pub fn format_ms(ms: i64) -> String {
+    const DAY: i64 = 86_400_000;
+    let days = ms.div_euclid(DAY);
+    let rest = ms.rem_euclid(DAY);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        year,
+        month,
+        day,
+        rest / 3_600_000,
+        (rest % 3_600_000) / 60_000,
+        (rest % 60_000) / 1_000
+    )
+}
+
 /// UTC month bucket for a timestamp: `(start_ms, end_ms_exclusive, "YYYYMM")`.
 /// Used by the cold-storage archiver.
 pub fn month_bounds_ms(ts_ms: i64) -> (i64, i64, String) {

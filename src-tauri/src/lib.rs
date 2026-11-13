@@ -2,6 +2,7 @@ mod attrib;
 mod collector;
 mod config;
 mod db;
+mod downloaders;
 mod etw;
 mod fingerprint;
 mod identity;

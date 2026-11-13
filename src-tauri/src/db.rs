@@ -408,6 +408,29 @@ impl Store {
         Ok(true)
     }
 
+    /// Record a downloader task as a real timeline event. Idempotent on
+    /// `(file_id, kind='downloaded', ts)` so repeated rescans do not spam.
+    pub fn record_download(&self, file_id: i64, ts: i64, note: &str) -> rusqlite::Result<bool> {
+        let conn = self.lock();
+        let already: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM events
+                  WHERE file_id = ?1 AND kind = 'downloaded' AND ts = ?2 LIMIT 1",
+                params![file_id, ts],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if already.is_some() {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO events (file_id, kind, ts, size, attribution, note)
+             VALUES (?1, 'downloaded', ?2, 0, 'download-task', ?3)",
+            params![file_id, ts, note],
+        )?;
+        Ok(true)
+    }
+
     pub fn mark_gone(&self, path: &str) -> rusqlite::Result<()> {
         self.lock().execute(
             "UPDATE files SET liveness = 'gone' WHERE path = ?1",
@@ -1302,6 +1325,7 @@ fn event_label(kind: &str) -> String {
         "removed" => "删除".into(),
         "observed" => "首次登记".into(),
         "opened" => "被打开".into(),
+        "downloaded" => "下载".into(),
         other => other.to_string(),
     }
 }

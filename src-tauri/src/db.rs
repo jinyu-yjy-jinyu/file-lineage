@@ -869,9 +869,9 @@ impl Store {
                         }
                     }
                 }
-            }
-            // The semicolon matters: as a block-trailing expression the
-            // if-let's temporary `Result<Statement<'_>>` would outlive the
+            };
+            // The trailing semicolon matters: as a block-trailing expression
+            // the if-let's temporary `Result<Statement<'_>>` would outlive the
             // `conn` guard (E0597).
         }
         let archived_total = self.with_archives(|list| {

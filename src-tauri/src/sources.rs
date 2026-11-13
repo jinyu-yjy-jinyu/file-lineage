@@ -15,7 +15,9 @@ use std::process;
 
 use rusqlite::{Connection, OpenFlags};
 
+use crate::im_layout;
 use crate::util::path_key;
+use crate::zoneid;
 use crate::SourceInfo;
 
 /// Chrome/Edge/Firefox timestamps: microseconds since 1601-01-01.
@@ -370,6 +372,64 @@ fn hex(c: u8) -> Option<u8> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
+}
+
+/// Full source resolution, strongest evidence first.
+///
+/// Order matters and is the whole point of V2's source work:
+///   1. `Zone.Identifier` — written by the downloader itself, browser
+///      independent, survives cleared history, names the real origin host;
+///   2. browser download databases — gives page context and timestamps;
+///   3. IM receive-tree layout — names the account and the receive month;
+///   4. mail-ish file extensions;
+///   5. plain path shape.
+pub fn resolve(sources: &Sources, path: &str, name: &str, size: i64) -> SourceInfo {
+    if let Some(zone) = zoneid::read(path) {
+        let origin = zone.origin();
+        let headline = if origin.is_empty() {
+            format!("Internet 下载 · {}", zone.zone_label())
+        } else {
+            format!("Internet 下载 · {}", origin)
+        };
+        let mut parts = vec![format!("来源区域：{}", zone.zone_label())];
+        if !zone.host.is_empty() {
+            parts.push(format!("下载地址：{}", zone.host));
+        }
+        if !zone.referrer.is_empty() {
+            parts.push(format!("来源页面：{}", zone.referrer));
+        }
+        parts.push("证据：文件 Zone.Identifier 备用数据流（写入方标记，与浏览器无关）".to_string());
+        return SourceInfo {
+            kind: "download".to_string(),
+            label: headline,
+            detail: Some(parts.join("\n")),
+        };
+    }
+
+    if let Some(found) = sources.lookup(path, name, size) {
+        return found;
+    }
+
+    if let Some(layout) = im_layout::parse(path) {
+        return SourceInfo {
+            kind: "im".to_string(),
+            label: layout.describe(),
+            detail: Some(format!(
+                "{}\n证据：IM 接收目录布局解析（账号目录 + 接收月份分桶）",
+                layout.describe()
+            )),
+        };
+    }
+
+    if let Some(hint) = im_layout::mail_extension_hint(name) {
+        return SourceInfo {
+            kind: "email".to_string(),
+            label: hint.to_string(),
+            detail: Some(format!("{}\n证据：文件扩展名", hint)),
+        };
+    }
+
+    classify_path(path)
 }
 
 /// Path-shape classification: the fallback when no download record exists.

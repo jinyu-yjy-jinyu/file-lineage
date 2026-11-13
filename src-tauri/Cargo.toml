@@ -1,10 +1,11 @@
 [package]
 name = "file-lineage"
-version = "0.1.0"
+version = "0.2.0"
 description = "文件因果溯源台 — file causality & lineage for Windows"
 authors = ["FileLineage"]
 edition = "2021"
-rust-version = "1.77"
+# tauri 2.12 declares rust-version 1.90, so state the real floor.
+rust-version = "1.90"
 
 [lib]
 name = "file_lineage_lib"
@@ -14,19 +15,24 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 notify = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
 walkdir = "2"
+# Real process-level attribution: Microsoft-Windows-Kernel-File over ETW.
+# Pinned exactly: the 1.x callback/schema API is not yet stable across minors.
+ferrisetw = "=1.2.0"
 
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = "s"
-panic = "abort"
 strip = true
+# Deliberately NOT `panic = "abort"`: the app runs several background threads
+# (ETW callback, watcher, hasher, maintenance). With unwinding a bug in one of
+# them degrades that feature instead of killing the resident daemon.
 
 [profile.dev]
 incremental = true

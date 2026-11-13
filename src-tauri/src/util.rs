@@ -67,3 +67,71 @@ pub fn should_skip_dir(name: &str) -> bool {
             | "AppData"
     )
 }
+
+/// NUL-terminated UTF-16 for Win32 `*W` entry points.
+///
+/// This crate targets Windows only, so the platform module is used directly
+/// rather than behind `cfg` (fewer conditional-compilation mismatches).
+pub fn to_wide(value: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Same, but with the `\\?\` prefix that lifts the 260-character MAX_PATH
+/// limit and disables path normalization (dot segments, trailing spaces).
+pub fn extended_path(path: &std::path::Path) -> Vec<u16> {
+    let text = path.to_string_lossy();
+    if text.starts_with(r"\\") {
+        to_wide(path.as_os_str())
+    } else {
+        to_wide(std::ffi::OsStr::new(&format!(r"\\?\{}", text)))
+    }
+}
+
+/// Milliseconds since the Unix epoch for a `SystemTime`.
+pub fn millis(time: std::time::SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Civil date for days since 1970-01-01.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
+}
+
+/// UTC month bucket for a timestamp: `(start_ms, end_ms_exclusive, "YYYYMM")`.
+/// Used by the cold-storage archiver.
+pub fn month_bounds_ms(ts_ms: i64) -> (i64, i64, String) {
+    const DAY: i64 = 86_400_000;
+    let (year, month, _) = civil_from_days(ts_ms.div_euclid(DAY));
+    let start = days_from_civil(year, month, 1) * DAY;
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let end = days_from_civil(next_year, next_month, 1) * DAY;
+    (start, end, format!("{:04}{:02}", year, month))
+}

@@ -19,6 +19,8 @@ pub struct FileRow {
     pub hash_state: String,
     pub last_event_ts: i64,
     pub liveness: String,
+    /// Newest shell "Recent" timestamp, 0 when the file was never opened.
+    pub opened_ts: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +44,33 @@ pub struct CopyRow {
     pub path: String,
     pub size: i64,
     pub mtime: i64,
+    /// Same `(volume, file index)` as the file itself: a hard link, i.e. the
+    /// very same data reachable through another name. Deleting it frees nothing.
+    pub hardlink: bool,
+}
+
+/// A file that shares part of its 1 MiB chunk digests — "same project", not a copy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelatedRow {
+    pub id: i64,
+    pub path: String,
+    pub size: i64,
+    pub shared_chunks: i64,
+    pub total_chunks: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Counts {
+    pub files: i64,
+    pub events: i64,
+    pub hashed: i64,
+    pub pending: i64,
+    /// Files whose `(volume, file index)` identity is known.
+    pub identified: i64,
+    pub chunks: i64,
+    pub incremental: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +127,7 @@ pub struct FileDetail {
     pub file: FileRow,
     pub versions: Vec<EventRow>,
     pub copies: Vec<CopyRow>,
+    pub related: Vec<RelatedRow>,
     pub graph: Graph,
     pub answers: Answers,
 }
@@ -125,4 +155,24 @@ pub struct Status {
     pub last_error: Option<String>,
     pub adapters: Vec<String>,
     pub source_records: i64,
+
+    // ---- V2: collection hardening -----------------------------------------
+    /// Is this process running with an elevated token?
+    pub elevated: bool,
+    /// `disabled` | `active` | `denied` | `error: …`
+    pub etw_state: String,
+    /// Events attributed by ETW rather than Restart Manager this session.
+    pub etw_events: i64,
+    pub autostart: bool,
+    pub autostart_command: Option<String>,
+    pub config_path: String,
+    pub archived_events: i64,
+    pub archive_files: i64,
+    pub last_archive_at: i64,
+    pub identified_files: i64,
+    pub chunk_count: i64,
+    pub incremental_hashes: i64,
+    pub recent_entries: i64,
+    pub total_db_size: i64,
+    pub schema_version: i64,
 }

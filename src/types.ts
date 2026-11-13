@@ -8,6 +8,10 @@ export interface FileRow {
   sourceKind: string;
   sourceLabel: string;
   sourceDetail: string | null;
+  /** Evidence channel id, e.g. `zone.ads` / `path.shape` / `rm.handle`. */
+  sourceEvidence: string;
+  /** 3 objective · 2 strong indirect · 1 heuristic · 0 none */
+  sourceStrength: number;
   changeCount: number;
   createdAt: number;
   duplicateCount: number;
@@ -15,6 +19,8 @@ export interface FileRow {
   hashState: string;
   lastEventTs: number;
   liveness: string;
+  /** Newest shell "Recent" timestamp, 0 when the file was never opened. */
+  openedTs: number;
 }
 
 export interface EventRow {
@@ -34,6 +40,17 @@ export interface CopyRow {
   path: string;
   size: number;
   mtime: number;
+  /** Same `(volume, file index)`: a hard link, i.e. the very same data. */
+  hardlink: boolean;
+}
+
+/** A file that shares some 1 MiB chunk digests — "same project", not a copy. */
+export interface RelatedRow {
+  id: number;
+  path: string;
+  size: number;
+  sharedChunks: number;
+  totalChunks: number;
 }
 
 export interface GraphNode {
@@ -59,6 +76,7 @@ export interface Graph {
 export interface Answer {
   headline: string;
   detail: string;
+  /** high | medium | low */
   confidence: string;
 }
 
@@ -68,12 +86,28 @@ export interface Answers {
   safety: Answer;
 }
 
+/** Q1+Q2+Q3 folded into one conclusion with a derived confidence. */
+export interface Verdict {
+  headline: string;
+  detail: string;
+  /** high | medium | low */
+  confidence: string;
+  /** 5..=97, computed from evidence strength on the Rust side. */
+  score: number;
+  drivers: string[];
+  caveats: string[];
+  /** delete_safe | keep | verify_first */
+  action: string;
+}
+
 export interface FileDetail {
   file: FileRow;
   versions: EventRow[];
   copies: CopyRow[];
+  related: RelatedRow[];
   graph: Graph;
   answers: Answers;
+  verdict: Verdict;
 }
 
 export interface Status {
@@ -96,6 +130,27 @@ export interface Status {
   lastError: string | null;
   adapters: string[];
   sourceRecords: number;
+
+  // ---- collection hardening ------------------------------------------------
+  elevated: boolean;
+  /** `disabled` | `active` | `denied: …` | `unsupported: …` | `error: …` */
+  etwState: string;
+  etwEvents: number;
+  /** Registry/plist/desktop-file truth. */
+  autostart: boolean;
+  /** What `config.ini` says — may differ from `autostart` when a write failed. */
+  autostartConfigured: boolean;
+  autostartCommand: string | null;
+  configPath: string;
+  archivedEvents: number;
+  archiveFiles: number;
+  lastArchiveAt: number;
+  identifiedFiles: number;
+  chunkCount: number;
+  incrementalHashes: number;
+  recentEntries: number;
+  totalDbSize: number;
+  schemaVersion: number;
 }
 
 export const emptyStatus: Status = {
@@ -118,4 +173,20 @@ export const emptyStatus: Status = {
   lastError: null,
   adapters: [],
   sourceRecords: 0,
+  elevated: false,
+  etwState: "starting",
+  etwEvents: 0,
+  autostart: false,
+  autostartConfigured: false,
+  autostartCommand: null,
+  configPath: "",
+  archivedEvents: 0,
+  archiveFiles: 0,
+  lastArchiveAt: 0,
+  identifiedFiles: 0,
+  chunkCount: 0,
+  incrementalHashes: 0,
+  recentEntries: 0,
+  totalDbSize: 0,
+  schemaVersion: 0,
 };

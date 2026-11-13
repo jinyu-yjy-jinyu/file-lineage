@@ -95,35 +95,56 @@ impl Collector {
         }
         self.running.store(true, Ordering::SeqCst);
 
+        // A failed `spawn` used to be swallowed by `.ok()`, which left the
+        // daemon running with a dead channel and no warning anywhere. Every
+        // failure now reaches `Status::last_error` and `startup.log`.
         let me = Arc::clone(self);
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("fl-watcher".into())
             .spawn(move || me.watch_loop())
-            .ok();
+        {
+            self.report_error(&format!("无法启动文件监控线程：{}", error));
+        }
 
         let me = Arc::clone(self);
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("fl-hasher".into())
             .spawn(move || me.hash_loop())
-            .ok();
+        {
+            self.report_error(&format!("无法启动指纹线程：{}", error));
+        }
 
         let me = Arc::clone(self);
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("fl-maintenance".into())
             .spawn(move || me.maintenance_loop())
-            .ok();
+        {
+            self.report_error(&format!("无法启动维护线程：{}", error));
+        }
 
         self.start_etw();
         self.rescan();
     }
 
+    fn report_error(&self, message: &str) {
+        crate::startup::log(message);
+        self.update(|s| s.last_error = Some(message.to_string()));
+    }
+
     /// Start the ETW kernel channel when configured. Failure is never fatal:
     /// the Restart Manager channel keeps working, and the reason is surfaced
-    /// through `Status::etw_state` so a future UI can explain it.
+    /// through `Status::etw_state` so the UI can explain it.
     fn start_etw(self: &Arc<Self>) {
         let enabled = self.config.lock().map(|c| c.enable_etw).unwrap_or(true);
-        if !enabled {
-            self.update(|s| s.etw_state = "disabled".into());
+        if !enabled || !cfg!(windows) {
+            // A disabled switch and a platform without ETW produce distinct,
+            // honest states.
+            let state = if enabled {
+                "unsupported: 本平台没有 ETW，进程级归因不可用"
+            } else {
+                "disabled"
+            };
+            self.update(|s| s.etw_state = state.into());
             return;
         }
         let elevated = crate::runtime::is_elevated();
@@ -134,14 +155,19 @@ impl Collector {
             EtwStart::NotElevated => self.update(|s| {
                 s.etw_state = "denied: 需要管理员权限，当前使用 Restart Manager".into()
             }),
+            // `Disabled`/`Unsupported` cannot be produced through this path any
+            // more (handled above), but the match must stay exhaustive.
             EtwStart::Disabled => self.update(|s| s.etw_state = "disabled".into()),
+            EtwStart::Unsupported => self.update(|s| {
+                s.etw_state = "unsupported: 本平台没有 ETW，进程级归因不可用".into()
+            }),
             EtwStart::Failed(reason) => self.update(|s| s.etw_state = format!("error: {}", reason)),
         }
     }
 
     pub fn rescan(self: &Arc<Self>) {
         let me = Arc::clone(self);
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("fl-scanner".into())
             .spawn(move || {
                 me.reload_sources();
@@ -149,7 +175,9 @@ impl Collector {
                 me.recent_backfill();
                 me.download_backfill();
             })
-            .ok();
+        {
+            self.report_error(&format!("无法启动扫描线程：{}", error));
+        }
     }
 
     #[allow(dead_code)]
@@ -267,6 +295,9 @@ impl Collector {
         self.update(|s| {
             s.scan_state = "scanning".into();
             s.scan_done = 0;
+            // An upfront total is impossible without walking twice; showing
+            // "0/…" for the whole scan was misleading, so the label is
+            // "已处理 N" and the total equals the processed count.
             s.scan_total = 0;
         });
 
@@ -312,6 +343,7 @@ impl Collector {
                         self.update(|s| s.last_error = Some(format!("扫描写入失败：{}", e)));
                     }
                     processed += n;
+                    self.store.invalidate_stats();
                     batch.clear();
                     let done = processed;
                     self.update(|s| s.scan_done = done);
@@ -326,6 +358,7 @@ impl Collector {
             }
             processed += n;
         }
+        self.store.invalidate_stats();
         self.update(|s| {
             s.scan_done = processed;
             s.scan_total = processed;
@@ -348,13 +381,17 @@ impl Collector {
             if !self.running.load(Ordering::Relaxed) {
                 return;
             }
-            for (id, _path) in self.store.ids_by_name(&name) {
+            for (id, _path) in self.store.ids_by_name(&name, "", 0) {
                 let note = format!(
                     "Shell「最近使用」记录（{} 个快捷方式）。打开者不会出现在文件写入事件里，因此这是推断信号。",
                     shortcut_count
                 );
-                if self.store.record_opened(id, ts, &note).unwrap_or(false) {
-                    matched += 1;
+                match self.store.record_opened(id, ts, &note) {
+                    Ok(true) => matched += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.report_error(&format!("写入打开记录失败：{}", error));
+                    }
                 }
             }
         }
@@ -393,7 +430,10 @@ impl Collector {
                 ids.push(id);
             }
             if ids.is_empty() {
-                for (id, _) in self.store.ids_by_name(&record.name) {
+                // Narrow by extension and size as well: a name-only match used
+                // to attach a download record to every same-named file.
+                let ext = crate::util::extension_of(&record.name);
+                for (id, _) in self.store.ids_by_name(&record.name, &ext, record.size) {
                     ids.push(id);
                 }
             }
@@ -404,8 +444,12 @@ impl Collector {
                 crate::downloaders::truncate(&record.task_id, 64)
             );
             for id in ids {
-                if self.store.record_download(id, ts, &note).unwrap_or(false) {
-                    added += 1;
+                match self.store.record_download(id, ts, &note) {
+                    Ok(true) => added += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.report_error(&format!("写入下载器任务事件失败：{}", error));
+                    }
                 }
             }
         }
@@ -556,16 +600,20 @@ impl Collector {
         if kind == ChangeKind::Removed {
             let key = path.to_string_lossy().to_string();
             if let Some(id) = self.store.id_for_path(&key) {
-                let _ = self.store.record_event(
+                if let Err(error) = self.store.record_event(
                     id,
                     "removed",
                     now_ms(),
                     0,
                     None,
                     Some("文件已从监控目录中消失"),
-                );
+                ) {
+                    self.report_error(&format!("记录删除事件失败：{}", error));
+                }
             }
-            let _ = self.store.mark_gone(&key);
+            if let Err(error) = self.store.mark_gone(&key) {
+                self.report_error(&format!("标记文件消失失败：{}", error));
+            }
             return;
         }
 
@@ -604,29 +652,65 @@ impl Collector {
                 notes.push("路径上的文件已被替换：FileID 变化，说明这不是同一个文件".to_string());
             }
         }
+
+        let src = self.resolve_source(&obs.path, &obs.name, obs.size, probe.as_ref());
+
+        // H5: reconnect a rename/move through file identity.
+        //
+        // Relying on a two-path rename event does not work across platforms:
+        // the Windows backend only emits `From` and `To`, macOS emits a single
+        // `Modify(Name(Any))` with just the new path, and Linux emits both. A
+        // `(volume_serial, file_index)` match against a row that is currently
+        // `gone` is the portable signal, and it keeps the file's whole lineage
+        // (events, chunks, source evidence) attached to the new path.
+        let reconnected = self.store.reconnect_identity(&obs, &src);
+        let id = match &reconnected {
+            Some((existing, previous_path)) => {
+                notes.push(format!(
+                    "由 {} 重命名/移动而来（FileID 未变，血缘已续接）",
+                    previous_path
+                ));
+                *existing
+            }
+            None => match self.store.upsert_file(&obs, &src) {
+                Ok(id) => id,
+                Err(error) => {
+                    self.report_error(&format!("写入文件记录失败：{}", error));
+                    return;
+                }
+            },
+        };
+        self.store.invalidate_stats();
         let combined = if notes.is_empty() {
             None
         } else {
             Some(notes.join("；"))
         };
-
-        let src = self.resolve_source(&obs.path, &obs.name, obs.size, probe.as_ref());
-        let Ok(id) = self.store.upsert_file(&obs, &src) else {
-            return;
+        // A reconnected change *is* a rename, whatever the raw event said.
+        let event_kind = if reconnected.is_some() {
+            "renamed"
+        } else {
+            kind.as_str()
         };
+
         let attributed = probe.as_ref().filter(|a| a.is_usable());
         let hit = attributed.is_some();
-        let recorded = self
+        let recorded = match self
             .store
             .record_event(
                 id,
-                kind.as_str(),
+                event_kind,
                 now_ms(),
                 obs.size,
                 attributed,
                 combined.as_deref(),
-            )
-            .unwrap_or(false);
+            ) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                self.report_error(&format!("写入变更事件失败：{}", error));
+                false
+            }
+        };
         if recorded {
             let ts = now_ms();
             self.update(|s| {
@@ -657,13 +741,11 @@ impl Collector {
             "Shell「最近使用」记录（{} 个快捷方式）。打开者不会出现在文件写入事件里，因此这是推断信号。",
             count
         );
-        if self
-            .store
-            .record_opened(file_id, ts, &note)
-            .unwrap_or(false)
-        {
-            self.update(|s| s.events_this_session += 1);
+        if let Err(error) = self.store.record_opened(file_id, ts, &note) {
+            self.report_error(&format!("写入打开记录失败：{}", error));
+            return;
         }
+        self.update(|s| s.events_this_session += 1);
     }
 
     // -------------------------------------------------------------- hashing
@@ -683,7 +765,9 @@ impl Collector {
             };
 
             // Only files that have stopped changing enter the queue.
-            let _ = self.store.promote_settled(now_ms(), settle_seconds);
+            if let Err(error) = self.store.promote_settled(now_ms(), settle_seconds) {
+                self.report_error(&format!("指纹队列推进失败：{}", error));
+            }
 
             if window_start.elapsed() >= Duration::from_secs(60) {
                 window_start = Instant::now();
@@ -696,11 +780,16 @@ impl Collector {
 
             let batch = self.store.pending_hash_batch(HASH_BATCH);
             if batch.is_empty() {
+                let mut queue_drained = false;
                 self.update(|s| {
                     if s.scan_state == "hashing" {
                         s.scan_state = "ready".into();
+                        queue_drained = true;
                     }
                 });
+                if queue_drained {
+                    self.store.invalidate_stats();
+                }
                 std::thread::sleep(Duration::from_millis(1_500));
                 continue;
             }
@@ -715,7 +804,10 @@ impl Collector {
                     return;
                 }
                 if size < 0 || size as u64 > MAX_HASH_BYTES {
-                    self.store.set_hash_state(id, "too_large");
+                    if let Err(error) = self.store.set_hash_state(id, "too_large") {
+                        self.report_error(&format!("写入 too_large 状态失败：{}", error));
+                    }
+                    self.store.invalidate_stats();
                     continue;
                 }
                 let previous = if incremental {
@@ -731,17 +823,34 @@ impl Collector {
                 match digest_file(Path::new(&path), reuse) {
                     Ok(digest) => {
                         let chunks = digest.chunks.len() as i64;
-                        let _ = self.store.set_digest(
+                        if let Err(error) = self.store.set_digest(
                             id,
                             &digest.root,
                             &digest.chunks,
                             digest.incremental,
-                        );
+                        ) {
+                            // A persistent write failure here means the file
+                            // never becomes comparable — it must be visible.
+                            self.report_error(&format!("写入内容指纹失败：{}", error));
+                            continue;
+                        }
                         window_chunks += chunks.max(1);
                         self.update(|s| s.hashed_count += 1);
+                        self.store.invalidate_stats();
                     }
-                    Err(HashError::TooLarge) => self.store.set_hash_state(id, "too_large"),
-                    Err(HashError::Io(_)) => self.store.set_hash_state(id, "error"),
+                    Err(HashError::TooLarge) => {
+                        if let Err(error) = self.store.set_hash_state(id, "too_large") {
+                            self.report_error(&format!("写入 too_large 状态失败：{}", error));
+                        }
+                        self.store.invalidate_stats();
+                    }
+                    Err(HashError::Io(error)) => {
+                        if let Err(write_error) = self.store.set_hash_state(id, "error") {
+                            self.report_error(&format!("写入哈希错误状态失败：{}", write_error));
+                        }
+                        self.store.invalidate_stats();
+                        crate::startup::log(&format!("哈希失败 {}：{}", path, error));
+                    }
                 }
             }
         }
@@ -793,7 +902,11 @@ fn classify_event(event: &Event) -> Option<ChangeKind> {
         EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => Some(ChangeKind::Renamed),
         EventKind::Modify(ModifyKind::Name(RenameMode::From)) => Some(ChangeKind::Removed),
         EventKind::Modify(ModifyKind::Name(RenameMode::To)) => Some(ChangeKind::Created),
-        EventKind::Modify(ModifyKind::Name(_)) => Some(ChangeKind::Modified),
+        // macOS FSEvents only reports the *new* path as `Name(Any)`; Linux
+        // inotify sends extra `Name(Any)` events alongside `Both`. Treating
+        // these as a plain `Modified` (the old behaviour) meant the new path was
+        // never inserted on macOS, so the rename was lost entirely.
+        EventKind::Modify(ModifyKind::Name(_)) => Some(ChangeKind::Renamed),
         EventKind::Modify(_) => Some(ChangeKind::Modified),
         EventKind::Access(_) => None,
         _ => Some(ChangeKind::Modified),

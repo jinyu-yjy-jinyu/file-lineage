@@ -64,12 +64,12 @@ impl Downloaders {
     }
 
     fn load_ghost(&mut self) -> usize {
-        let Ok(local) = std::env::var("LOCALAPPDATA") else {
+        // `data_local_dir()` is `%LOCALAPPDATA%` on Windows (exactly the old
+        // path) and the platform's local app-data root on macOS/Linux.
+        let Some(base) = dirs::data_local_dir() else {
             return 0;
         };
-        let tasks = std::path::Path::new(&local)
-            .join("GhostDownloader")
-            .join("tasks.jsonl");
+        let tasks = base.join("GhostDownloader").join("tasks.jsonl");
         // A busy downloader appends to this file; cap what we read so a huge
         // history can never stall startup.
         let Ok(text) = std::fs::read_to_string(&tasks) else {

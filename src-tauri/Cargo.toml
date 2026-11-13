@@ -1,7 +1,7 @@
 [package]
 name = "file-lineage"
-version = "0.2.2"
-description = "文件因果溯源台 — file causality & lineage for Windows"
+version = "0.3.0"
+description = "文件因果溯源台 — file causality & lineage for Windows, macOS and Linux"
 authors = ["FileLineage"]
 edition = "2021"
 # tauri 2.12 declares rust-version 1.90, so state the real floor.
@@ -22,8 +22,16 @@ notify = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
 walkdir = "2"
+# Platform directories (data dir, Downloads/Desktop/Documents, browser roots).
+# `Cargo.lock` already carries dirs 7.0.0 as a Tauri transitive dependency, so
+# this adds no new download.
+dirs = "7"
+
 # Real process-level attribution: Microsoft-Windows-Kernel-File over ETW.
 # Pinned exactly: the 1.x callback/schema API is not yet stable across minors.
+# Windows-only: ferrisetw has no target gating of its own, and ETW does not
+# exist on macOS/Linux, so it must not be built there at all.
+[target.'cfg(windows)'.dependencies]
 ferrisetw = "=1.2.0"
 
 [profile.release]

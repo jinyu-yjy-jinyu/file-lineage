@@ -1,11 +1,18 @@
-"""Generate the app icons used by Tauri's Windows bundle.
+"""Generate the app icons used by Tauri's Windows / macOS / Linux bundles.
 
 Run with the bundled Python (Pillow):
 
     python scripts/make_icons.py
 
 The motif is a three-node lineage graph: an origin, a file, and a copy.
-Drawing at 4x and downsampling keeps the small sizes crisp.
+The base image is 1024x1024 — the minimum `tauri icon` needs to emit both a
+crisp `.icns` for macOS and 512/256 PNGs for Linux. Everything is drawn with a
+scale factor relative to the original 512 design so the proportions do not
+change.
+
+After this script, `npx tauri icon src-tauri/icons/icon.png` produces the
+packaged set (including `icon.icns`); only the files Tauri's bundler needs are
+kept in `src-tauri/icons/`.
 """
 
 from pathlib import Path
@@ -16,12 +23,19 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "src-tauri" / "icons"
 OUT.mkdir(parents=True, exist_ok=True)
 
-SIZE = 512
+SIZE = 1024
+# The original artwork was designed on a 512px canvas.
+S = SIZE / 512
+
 BG = (13, 20, 32, 255)
 CARD = (22, 34, 52, 255)
 ACCENT = (86, 214, 200, 255)
 WARM = (255, 178, 92, 255)
 LINE = (74, 104, 132, 255)
+
+
+def px(value: float) -> int:
+    return int(round(value * S))
 
 
 def lerp(a, b, t):
@@ -39,13 +53,16 @@ def draw_icon() -> Image.Image:
         d.line([(0, y), (SIZE, y)], fill=color)
     mask = Image.new("L", (SIZE, SIZE), 0)
     ImageDraw.Draw(mask).rounded_rectangle(
-        (0, 0, SIZE - 1, SIZE - 1), radius=112, fill=255
+        (0, 0, SIZE - 1, SIZE - 1), radius=px(112), fill=255
     )
     img.putalpha(mask)
 
     d = ImageDraw.Draw(img)
     d.rounded_rectangle(
-        (28, 28, SIZE - 29, SIZE - 29), radius=94, outline=(58, 88, 116, 255), width=4
+        (px(28), px(28), px(483), px(483)),
+        radius=px(94),
+        outline=(58, 88, 116, 255),
+        width=px(4),
     )
 
     # Nodes of the lineage graph.
@@ -60,39 +77,44 @@ def draw_icon() -> Image.Image:
     for a, b in edges:
         x1, y1, _, _ = nodes[a]
         x2, y2, _, _ = nodes[b]
-        d.line([(x1, y1), (x2, y2)], fill=LINE, width=12)
+        d.line(
+            [(px(x1), px(y1)), (px(x2), px(y2))],
+            fill=LINE,
+            width=px(12),
+        )
         # A small directional tick in the middle.
         mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-        d.ellipse((mx - 9, my - 9, mx + 9, my + 9), fill=ACCENT)
+        d.ellipse(
+            (px(mx) - px(9), px(my) - px(9), px(mx) + px(9), px(my) + px(9)),
+            fill=ACCENT,
+        )
 
     for x, y, r, color in nodes:
-        d.ellipse((x - r - 10, y - r - 10, x + r + 10, y + r + 10), fill=(15, 24, 38, 255))
-        d.ellipse((x - r, y - r, x + r, y + r), fill=color)
+        d.ellipse(
+            (px(x - r - 10), px(y - r - 10), px(x + r + 10), px(y + r + 10)),
+            fill=(15, 24, 38, 255),
+        )
+        d.ellipse((px(x - r), px(y - r), px(x + r), px(y + r)), fill=color)
         if color == CARD:
             d.ellipse(
-                (x - r + 10, y - r + 10, x + r - 10, y + r - 10),
+                (px(x - r + 10), px(y - r + 10), px(x + r - 10), px(y + r - 10)),
                 outline=ACCENT,
-                width=9,
+                width=px(9),
             )
     return img
 
 
 def main():
     base = draw_icon()
-    for size in (16, 24, 32, 48, 64, 128, 256):
-        base.resize((size, size), Image.LANCZOS).save(OUT / f"_{size}.png")
+    base.save(OUT / "icon.png")
     base.resize((32, 32), Image.LANCZOS).save(OUT / "32x32.png")
     base.resize((128, 128), Image.LANCZOS).save(OUT / "128x128.png")
     base.resize((256, 256), Image.LANCZOS).save(OUT / "128x128@2x.png")
-    base.resize((512, 512), Image.LANCZOS).save(OUT / "icon.png")
     base.save(
         OUT / "icon.ico",
         format="ICO",
         sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
     )
-    # Intermediate files are not needed at runtime or in git.
-    for size in (16, 24, 32, 48, 64, 128, 256):
-        (OUT / f"_{size}.png").unlink(missing_ok=True)
     print("icons written to", OUT)
 
 

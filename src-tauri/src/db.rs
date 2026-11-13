@@ -7,12 +7,37 @@ use crate::attrib::Attribution;
 use crate::fingerprint::ChunkDigest;
 use crate::model::*;
 use crate::util::{human_size, month_bounds_ms, now_ms};
+use crate::verdict;
+
+/// Bumped whenever a table/column layout changes.
+pub const SCHEMA_VERSION: i64 = 3;
+/// Bumped only when the digest algorithm or its inputs change.
+pub const HASH_ALGO_VERSION: &str = "2";
 
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
     pub kind: String,
     pub label: String,
     pub detail: Option<String>,
+    /// Evidence channel id (`zone.ads`, `downloader.task`, `browser.exact`,
+    /// `browser.name_size`, `im.layout`, `mail.ext`, `path.shape`, `rm.handle`,
+    /// `none`). Stored so confidence can be derived instead of guessed.
+    pub evidence: String,
+    /// 3 = objective, 2 = strong indirect, 1 = heuristic, 0 = none.
+    pub strength: i64,
+}
+
+impl SourceInfo {
+    /// Fallback used when a source adapter produced nothing at all.
+    pub fn unknown() -> Self {
+        Self {
+            kind: "unknown".to_string(),
+            label: "来源未知".to_string(),
+            detail: None,
+            evidence: "none".to_string(),
+            strength: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +100,8 @@ CREATE TABLE IF NOT EXISTS files (
     source_kind   TEXT    NOT NULL DEFAULT 'unknown',
     source_label  TEXT    NOT NULL DEFAULT '',
     source_detail TEXT,
+    source_evidence TEXT  NOT NULL DEFAULT '',
+    source_strength INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL,
     last_seen_at  INTEGER NOT NULL,
     change_count  INTEGER NOT NULL DEFAULT 0,
@@ -126,6 +153,10 @@ const V2_COLUMNS: &[(&str, &str)] = &[
     ("file_index", "INTEGER"),
     ("chunk_count", "INTEGER NOT NULL DEFAULT 0"),
     ("opened_ts", "INTEGER NOT NULL DEFAULT 0"),
+    // 0.3.0: evidence channel + strength drive every confidence figure.
+    // Deliberately NOT indexed: they are only read per file row.
+    ("source_evidence", "TEXT NOT NULL DEFAULT ''"),
+    ("source_strength", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Bare column names on the right-hand side refer to the *pre-update* row,
@@ -138,16 +169,19 @@ const V2_COLUMNS: &[(&str, &str)] = &[
 const UPSERT_SQL: &str = r#"
 INSERT INTO files
     (path, name, ext, size, mtime, source_kind, source_label, source_detail,
+     source_evidence, source_strength,
      hash_state, created_at, last_seen_at, change_count, liveness,
      volume_serial, file_index)
 VALUES
-    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'settling', ?9, ?9, 0, 'live', ?10, ?11)
+    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?12, ?13, 'settling', ?9, ?9, 0, 'live', ?10, ?11)
 ON CONFLICT(path) DO UPDATE SET
     last_seen_at  = excluded.last_seen_at,
     liveness      = 'live',
     source_kind   = excluded.source_kind,
     source_label  = excluded.source_label,
     source_detail = excluded.source_detail,
+    source_evidence = excluded.source_evidence,
+    source_strength = excluded.source_strength,
     volume_serial = COALESCE(excluded.volume_serial, volume_serial),
     file_index    = COALESCE(excluded.file_index, file_index),
     content_hash  = CASE WHEN size <> excluded.size OR mtime <> excluded.mtime
@@ -169,6 +203,17 @@ SELECT id, 'observed', ?2, ?3, 'baseline',
    AND NOT EXISTS (SELECT 1 FROM events e WHERE e.file_id = files.id)
 "#;
 
+/// `%`/`_` in a user query must be escaped, otherwise searching `a_b` also
+/// matches `axb`. Paired with `ESCAPE '\'` in the SQL.
+fn like_pattern(query: &str) -> String {
+    let escaped = query
+        .to_lowercase()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{}%", escaped)
+}
+
 const LIST_SQL: &str = r#"
 SELECT f.id, f.path, f.name, f.ext, f.size, f.mtime,
        f.source_kind, f.source_label, f.source_detail,
@@ -179,11 +224,22 @@ SELECT f.id, f.path, f.name, f.ext, f.size, f.mtime,
            AND d.id <> f.id
            AND d.liveness = 'live') AS dup_count,
        COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.file_id = f.id), f.created_at) AS last_ts,
-       f.created_at, f.opened_ts
+       f.created_at, f.opened_ts, f.source_evidence, f.source_strength
   FROM files f
- WHERE (?1 = '' OR lower(f.name) LIKE ?2 OR lower(f.path) LIKE ?2)
+ WHERE (?1 = '' OR lower(f.name) LIKE ?2 ESCAPE '\' OR lower(f.path) LIKE ?2 ESCAPE '\')
+   AND (?5 = '' OR f.source_kind = ?5)
  ORDER BY last_ts DESC
  LIMIT ?3 OFFSET ?4
+"#;
+
+/// Note on `ESCAPE '\'`: this string is a Rust raw string, so the SQL the
+/// engine receives is literally `ESCAPE '\'` — a one-character backslash
+/// escape clause, exactly what SQLite requires.
+
+const COUNT_SQL: &str = r#"
+SELECT COUNT(*) FROM files f
+ WHERE (?1 = '' OR lower(f.name) LIKE ?2 ESCAPE '\' OR lower(f.path) LIKE ?2 ESCAPE '\')
+   AND (?3 = '' OR f.source_kind = ?3)
 "#;
 
 const FILE_BY_ID_SQL: &str = r#"
@@ -195,7 +251,7 @@ SELECT f.id, f.path, f.name, f.ext, f.size, f.mtime,
            AND d.content_hash = f.content_hash
            AND d.id <> f.id AND d.liveness = 'live'),
        COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.file_id = f.id), f.created_at),
-       f.created_at, f.opened_ts
+       f.created_at, f.opened_ts, f.source_evidence, f.source_strength
   FROM files f WHERE f.id = ?1
 "#;
 
@@ -204,12 +260,31 @@ SELECT id, kind, ts, size, process_name, process_path, pid, attribution, note
   FROM events WHERE file_id = ?1 ORDER BY ts DESC, id DESC LIMIT ?2
 "#;
 
+/// Everything `get_status` needs, computed at most once per TTL. The status
+/// endpoint is polled continuously, and each of these figures used to be a
+/// full table scan (or a `COUNT(*)` over the million-row chunk table).
+#[derive(Debug, Clone, Default)]
+pub struct DbStats {
+    pub counts: Counts,
+    pub db_size: i64,
+    pub total_db_size: i64,
+    pub archived_events: i64,
+    pub archive_files: i64,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
     pub db_path: PathBuf,
     archive_dir: PathBuf,
     /// Lazily opened read-only archive databases, keyed by file name.
     archives: Mutex<Option<Vec<(PathBuf, Connection)>>>,
+    /// Directories the collector watches. A "unique copy" conclusion is only
+    /// meaningful for files inside them.
+    watch_dirs: Mutex<Vec<PathBuf>>,
+    /// `(computed_at_ms, stats)` — see [`Store::stats`].
+    stats_cache: Mutex<Option<(i64, DbStats)>>,
+    /// Last non-fatal storage error, surfaced through `Status::last_error`.
+    last_error: Mutex<Option<String>>,
 }
 
 impl Store {
@@ -236,17 +311,76 @@ impl Store {
             db_path: path.to_path_buf(),
             archive_dir,
             archives: Mutex::new(None),
+            watch_dirs: Mutex::new(Vec::new()),
+            stats_cache: Mutex::new(None),
+            last_error: Mutex::new(None),
         })
+    }
+
+    /// Record the directories the collector watches. Called once at startup;
+    /// used by the Q3 coverage rule ("唯一副本" only holds inside them).
+    pub fn set_watch_dirs(&self, dirs: Vec<PathBuf>) {
+        if let Ok(mut guard) = self.watch_dirs.lock() {
+            *guard = dirs;
+        }
+    }
+
+    fn is_watched(&self, path: &str) -> bool {
+        let Ok(guard) = self.watch_dirs.lock() else {
+            return false;
+        };
+        if guard.is_empty() {
+            // The collector only ever inserts files it found under the watch
+            // dirs; an empty list means "not configured yet", not "outside".
+            return true;
+        }
+        let candidate = Path::new(path);
+        guard.iter().any(|dir| candidate.starts_with(dir))
+    }
+
+    /// Persist a non-fatal storage error for the status endpoint.
+    pub fn set_last_error(&self, message: impl Into<String>) {
+        if let Ok(mut guard) = self.last_error.lock() {
+            *guard = Some(message.into());
+        }
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Re-open the main connection. Used when a failed `DETACH` would leave the
+    /// `arch` schema attached and make every later `ATTACH arch` fail — which
+    /// silently stops archiving forever.
+    fn reopen(&self) -> rusqlite::Result<()> {
+        let conn = Connection::open(&self.db_path)?;
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+        conn.execute_batch(SCHEMA_TABLES)?;
+        migrate(&conn)?;
+        conn.execute_batch(SCHEMA_INDEXES)?;
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = conn;
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Size of the main database file plus its WAL/SHM companions.
     pub fn db_size(&self) -> i64 {
-        std::fs::metadata(&self.db_path)
+        let mut total = std::fs::metadata(&self.db_path)
             .map(|m| m.len() as i64)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        for suffix in ["-wal", "-shm"] {
+            let companion = PathBuf::from(format!("{}{}", self.db_path.to_string_lossy(), suffix));
+            total += std::fs::metadata(companion)
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
+        }
+        total
     }
 
     /// Total size of the main database plus every archive file.
@@ -260,6 +394,39 @@ impl Store {
             }
         }
         total
+    }
+
+    /// Cached [`DbStats`] for the status poll. `ttl_ms` bounds how stale the
+    /// numbers may be; the expensive aggregate queries run at most once per
+    /// window instead of on every 2.5 s poll. Writers call
+    /// [`Store::invalidate_stats`] on meaningful changes so the next poll
+    /// recomputes immediately.
+    pub fn stats(&self, ttl_ms: i64) -> DbStats {
+        let now = now_ms();
+        if let Ok(guard) = self.stats_cache.lock() {
+            if let Some((computed_at, cached)) = guard.as_ref() {
+                if now - *computed_at < ttl_ms {
+                    return cached.clone();
+                }
+            }
+        }
+        let fresh = DbStats {
+            counts: self.counts(),
+            db_size: self.db_size(),
+            total_db_size: self.total_size(),
+            archived_events: self.archived_event_count(),
+            archive_files: self.archive_file_count(),
+        };
+        if let Ok(mut guard) = self.stats_cache.lock() {
+            *guard = Some((now, fresh.clone()));
+        }
+        fresh
+    }
+
+    pub fn invalidate_stats(&self) {
+        if let Ok(mut guard) = self.stats_cache.lock() {
+            *guard = None;
+        }
     }
 
     // ------------------------------------------------------------- writing
@@ -287,12 +454,15 @@ impl Store {
                     src.detail,
                     now,
                     obs.volume,
-                    obs.file_index
+                    obs.file_index,
+                    src.evidence,
+                    src.strength
                 ])?;
                 baseline.execute(params![obs.path, now, obs.size])?;
             }
         }
         tx.commit()?;
+        self.invalidate_stats();
         Ok(items.len())
     }
 
@@ -312,7 +482,9 @@ impl Store {
                 src.detail,
                 now,
                 obs.volume,
-                obs.file_index
+                obs.file_index,
+                src.evidence,
+                src.strength
             ],
         )?;
         conn.query_row(
@@ -320,6 +492,83 @@ impl Store {
             params![obs.path],
             |r| r.get(0),
         )
+    }
+
+    /// Reconnect a rename/move instead of inserting a second row.
+    ///
+    /// Windows' `notify` backend never emits `RenameMode::Both` (only `From`
+    /// and `To`), macOS emits a single `Name(Any)` with just the new path, and
+    /// Linux emits both a `Both` and extra single-path events. Relying on a
+    /// two-path event therefore breaks lineage on two of three platforms. The
+    /// file identity `(volume_serial, file_index)` is the portable signal: if a
+    /// row with the same identity currently marked `gone` exists, the new path
+    /// is *the same file* and only its path column changes.
+    ///
+    /// Returns `(id, previous_path)` when a row was reconnected.
+    pub fn reconnect_identity(
+        &self,
+        obs: &FileObservation,
+        src: &SourceInfo,
+    ) -> Option<(i64, String)> {
+        let (volume, index) = (obs.volume?, obs.file_index?);
+        let conn = self.lock();
+        let now = now_ms();
+        // The `NOT EXISTS` guard also keeps the UNIQUE(path) constraint safe
+        // when the destination path is already occupied by a live row.
+        let previous: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, path FROM files
+                  WHERE volume_serial = ?1 AND file_index = ?2
+                    AND path <> ?3 AND liveness = 'gone'
+                    AND NOT EXISTS (SELECT 1 FROM files x WHERE x.path = ?3)
+                  LIMIT 1",
+                params![volume, index, obs.path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let (id, old_path) = previous?;
+        let updated = conn.execute(
+            "UPDATE files SET
+                 path = ?1, name = ?2, ext = ?3, size = ?4, mtime = ?5,
+                 source_kind = ?6, source_label = ?7, source_detail = ?8,
+                 source_evidence = ?9, source_strength = ?10,
+                 liveness = 'live', last_seen_at = ?11,
+                 volume_serial = COALESCE(?12, volume_serial),
+                 file_index = COALESCE(?13, file_index),
+                 content_hash = CASE WHEN size <> ?4 OR mtime <> ?5
+                                     THEN NULL ELSE content_hash END,
+                 hash_state = CASE WHEN size <> ?4 OR mtime <> ?5
+                                   THEN 'settling' ELSE hash_state END,
+                 hash_reason = CASE WHEN size <> ?4 OR mtime <> ?5
+                                    THEN NULL ELSE hash_reason END
+               WHERE id = ?14",
+            params![
+                obs.path,
+                obs.name,
+                obs.ext,
+                obs.size,
+                obs.mtime,
+                src.kind,
+                src.label,
+                src.detail,
+                src.evidence,
+                src.strength,
+                now,
+                obs.volume,
+                obs.file_index,
+                id
+            ],
+        );
+        match updated {
+            Ok(0) => None,
+            Ok(_) => Some((id, old_path)),
+            Err(error) => {
+                self.set_last_error(format!("重命名重连失败：{}", error));
+                None
+            }
+        }
     }
 
     /// Returns `false` when the event was suppressed by the throttle.
@@ -364,6 +613,7 @@ impl Store {
             "UPDATE files SET change_count = change_count + 1 WHERE id = ?1",
             params![file_id],
         )?;
+        self.invalidate_stats();
         Ok(true)
     }
 
@@ -457,16 +707,28 @@ impl Store {
         .ok()
     }
 
-    /// Every tracked file with this exact name (case-insensitive).
-    pub fn ids_by_name(&self, name: &str) -> Vec<(i64, String)> {
+    /// Every tracked file with this exact name (case-insensitive), narrowed by
+    /// extension and size when the caller knows them.
+    ///
+    /// Name-only matching is what made "open `/Downloads/report.pdf`" write an
+    /// `opened` event onto *every* `report.pdf` in the database, so callers
+    /// pass whatever the source record knows (`""`/`0` = unknown, keep).
+    pub fn ids_by_name(&self, name: &str, ext: &str, size: i64) -> Vec<(i64, String)> {
         let conn = self.lock();
         let mut stmt = match conn.prepare(
-            "SELECT id, path FROM files WHERE lower(name) = ?1 AND liveness = 'live' LIMIT 200",
+            "SELECT id, path FROM files
+              WHERE lower(name) = ?1 AND liveness = 'live'
+                AND (?2 = '' OR ext = ?2)
+                AND (?3 <= 0 OR size <= 0 OR size = ?3)
+              LIMIT 200",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let rows = stmt.query_map(params![name.to_lowercase()], |r| Ok((r.get(0)?, r.get(1)?)));
+        let rows = stmt.query_map(
+            params![name.to_lowercase(), ext.to_lowercase(), size],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
         match rows {
             Ok(rows) => rows.flatten().collect(),
             Err(_) => Vec::new(),
@@ -559,11 +821,104 @@ impl Store {
         tx.commit()
     }
 
-    pub fn set_hash_state(&self, id: i64, state: &str) {
-        let _ = self.lock().execute(
+    pub fn set_hash_state(&self, id: i64, state: &str) -> rusqlite::Result<()> {
+        self.lock().execute(
             "UPDATE files SET hash_state = ?1 WHERE id = ?2",
             params![state, id],
-        );
+        )?;
+        Ok(())
+    }
+
+    /// Live files still waiting for a full digest. Q3 uses this as the
+    /// "coverage" denominator: with unfinished fingerprints in the database, an
+    /// "only copy" conclusion is not safe, so the answer must degrade.
+    pub fn pending_hash_count(&self) -> i64 {
+        self.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM files
+                  WHERE hash_state IN ('pending','settling','error') AND liveness = 'live'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    /// Total events (live + archived) and distinct attributed processes for one
+    /// file. Used so Q2's "N 个进程碰过它" is not computed from a truncated
+    /// 500-row page.
+    pub fn event_totals(&self, file_id: i64) -> (i64, i64) {
+        let mut names: Vec<String> = Vec::new();
+        let mut total = 0i64;
+        {
+            let conn = self.lock();
+            total += conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE file_id = ?1",
+                    params![file_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT DISTINCT process_name FROM events
+                  WHERE file_id = ?1 AND process_name IS NOT NULL",
+            ) {
+                if let Ok(rows) = stmt.query_map(params![file_id], |r| r.get::<_, String>(0)) {
+                    for name in rows.flatten() {
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
+                }
+            }
+        }
+        let (archived_total, _) = self.with_archives(|list| {
+            let mut count = 0i64;
+            for (_, conn) in list {
+                count += conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE file_id = ?1",
+                        params![file_id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0);
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT DISTINCT process_name FROM events
+                      WHERE file_id = ?1 AND process_name IS NOT NULL",
+                ) {
+                    if let Ok(rows) = stmt.query_map(params![file_id], |r| r.get::<_, String>(0)) {
+                        for name in rows.flatten() {
+                            if !names.contains(&name) {
+                                names.push(name);
+                            }
+                        }
+                    }
+                }
+            }
+            count
+        });
+        (total + archived_total, names.len() as i64)
+    }
+
+    pub fn schema_version(&self) -> i64 {
+        self.meta_i64("schema_version", 0)
+    }
+
+    pub fn hash_algo_version(&self) -> i64 {
+        self.meta_i64("hash_algo_version", 0)
+    }
+
+    fn meta_i64(&self, key: &str, fallback: i64) -> i64 {
+        self.lock()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(fallback)
     }
 
     // --------------------------------------------------------------- reading
@@ -595,18 +950,34 @@ impl Store {
         .unwrap_or_default()
     }
 
-    pub fn list_files(&self, query: &str, limit: i64, offset: i64) -> Vec<FileRow> {
+    /// `kind` filters server-side (`""` = all) so a filter chip can never show
+    /// an empty list while matching rows exist further down the table.
+    pub fn list_files(&self, query: &str, kind: &str, limit: i64, offset: i64) -> Vec<FileRow> {
         let conn = self.lock();
         let mut stmt = match conn.prepare(LIST_SQL) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let pattern = format!("%{}%", query.to_lowercase());
-        let rows = stmt.query_map(params![query, pattern, limit, offset], row_to_file);
+        let pattern = like_pattern(query);
+        let rows = stmt.query_map(
+            params![query, pattern, limit, offset, kind],
+            row_to_file,
+        );
         match rows {
             Ok(rows) => rows.flatten().collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// Total rows matching the same filter as [`Store::list_files`].
+    pub fn count_files(&self, query: &str, kind: &str) -> i64 {
+        let conn = self.lock();
+        conn.query_row(
+            COUNT_SQL,
+            params![query, like_pattern(query), kind],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
     }
 
     /// Live events plus the same file's archived events, newest first.
@@ -763,7 +1134,7 @@ impl Store {
         stmt.query_row(params![id], row_to_file).ok()
     }
 
-    pub fn file_detail(&self, id: i64) -> Option<FileDetail> {
+    pub fn file_detail(&self, id: i64, ctx: &verdict::VerdictContext) -> Option<FileDetail> {
         let file = self.file_row(id)?;
         let versions = self.events_for_file(id);
         let (volume, index) = self.identity_for_path(&file.path).unwrap_or((None, None));
@@ -776,7 +1147,31 @@ impl Store {
         for row in related.iter_mut() {
             row.total_chunks = chunk_count as i64;
         }
-        let answers = build_answers(&file, &versions, &copies, &related);
+        let processes = summarize_processes(&versions);
+        let (total_events, distinct_processes) = self.event_totals(id);
+        let pending_unhashed = self.pending_hash_count();
+        let watched = self.is_watched(&file.path);
+        let safety = verdict::SafetyDigest {
+            hash_state: file.hash_state.clone(),
+            real_copies: copies.iter().filter(|c| !c.hardlink).count() as i64,
+            hardlink_copies: copies.iter().filter(|c| c.hardlink).count() as i64,
+            pending_unhashed,
+            watched,
+            related: related.len() as i64,
+        };
+
+        let answers = build_answers(
+            &file,
+            &versions,
+            &copies,
+            &related,
+            &processes,
+            total_events,
+            distinct_processes,
+            ctx,
+            &safety,
+        );
+        let verdict = build_verdict(&file, &processes, ctx, &safety);
         let graph = build_graph(&file, &versions, &copies);
         Some(FileDetail {
             file,
@@ -785,6 +1180,7 @@ impl Store {
             related,
             graph,
             answers,
+            verdict,
         })
     }
 
@@ -805,6 +1201,7 @@ impl Store {
 
         let mut moved = 0i64;
         let mut touched: Vec<PathBuf> = Vec::new();
+        let mut detach_broken = false;
         let mut cursor = min_ts;
         let mut rounds = 0;
         while cursor <= max_ts && rounds < 600 {
@@ -813,18 +1210,36 @@ impl Store {
             let upper = end.min(cutoff_ms);
             if upper > start {
                 let archive_path = self.archive_dir.join(format!("archive-{}.db", month));
-                if let Some(count) = archive_month(&conn, &archive_path, start, upper) {
+                let (count, detach_failed) = archive_month(&conn, &archive_path, start, upper);
+                if let Some(count) = count {
                     moved += count;
                     if !touched.contains(&archive_path) {
                         touched.push(archive_path);
                     }
                 }
+                detach_broken |= detach_failed;
             }
             cursor = end;
         }
 
+        drop(conn);
+        if detach_broken {
+            // A failed DETACH leaves the `arch` schema attached, which makes
+            // every later `ATTACH arch` fail and stops archiving silently.
+            // Rebuilding the connection is the only reliable recovery, so it is
+            // done here and reported through `last_error`.
+            self.set_last_error(
+                "归档库 DETACH 失败，已重建数据库连接；本次归档可能不完整".to_string(),
+            );
+            if let Err(error) = self.reopen() {
+                self.set_last_error(format!("归档连接重建失败：{}", error));
+            }
+            if let Ok(mut cache) = self.archives.lock() {
+                *cache = None;
+            }
+        }
+
         if moved > 0 {
-            drop(conn);
             // Index creation is done on the archive file directly: an index on
             // an ATTACHed schema has to be qualified in a way that is easy to
             // get wrong, and this path only runs during maintenance.
@@ -832,17 +1247,25 @@ impl Store {
                 ensure_archive_index(path);
             }
             let conn = self.lock();
-            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
-            let _ = conn.execute(
+            // A failed checkpoint is harmless (WAL grows, next pass retries),
+            // but a failed `last_archive_at` write means the UI keeps saying
+            // "never archived" — log both instead of discarding.
+            if let Err(error) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+                crate::startup::log(&format!("WAL checkpoint 失败（无害，下次重试）：{}", error));
+            }
+            if let Err(error) = conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('last_archive_at', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![now_ms().to_string()],
-            );
+            ) {
+                crate::startup::log(&format!("写入 last_archive_at 失败：{}", error));
+            }
             drop(conn);
             if let Ok(mut cache) = self.archives.lock() {
                 *cache = None;
             }
         }
+        self.invalidate_stats();
         Ok(moved)
     }
 }
@@ -879,7 +1302,7 @@ fn archive_month(
     archive_path: &Path,
     start_ms: i64,
     end_ms: i64,
-) -> Option<i64> {
+) -> (Option<i64>, bool) {
     let attach = conn
         .execute(
             "ATTACH DATABASE ?1 AS arch",
@@ -887,7 +1310,7 @@ fn archive_month(
         )
         .is_ok();
     if !attach {
-        return None;
+        return (None, false);
     }
 
     let result = (|| -> rusqlite::Result<i64> {
@@ -919,8 +1342,10 @@ fn archive_month(
         Ok(deleted as i64)
     })();
 
-    let _ = conn.execute("DETACH DATABASE arch", []);
-    result.ok()
+    // A failed DETACH must never be swallowed: the `arch` name stays attached
+    // and every later `ATTACH arch` fails, stopping archiving for good.
+    let detach_failed = conn.execute("DETACH DATABASE arch", []).is_err();
+    (result.ok(), detach_failed)
 }
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -938,18 +1363,21 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
 
-    // V1 stored a whole-file BLAKE3; V2's content root is BLAKE3 over the chunk
-    // digests, so every hash inherited from V1 is a different value for the
-    // same bytes and must be recomputed before it can be compared.
-    let previous: Option<String> = conn
+    // The fingerprint scheme has its own version. It used to be conflated with
+    // `schema_version`, which meant a pure schema bump looked like an algorithm
+    // change (and vice versa). V1 stored a whole-file BLAKE3; the content root
+    // here is BLAKE3 over the chunk digests, so every inherited V1 hash is a
+    // different value for the same bytes and must be recomputed before it can be
+    // compared.
+    let algorithm: Option<String> = conn
         .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
+            "SELECT value FROM meta WHERE key = 'hash_algo_version'",
             [],
             |r| r.get(0),
         )
         .optional()?;
-    if previous.as_deref() != Some("2") {
-        let _ = conn.execute(
+    if algorithm.as_deref() != Some(HASH_ALGO_VERSION) {
+        conn.execute(
             "UPDATE files
                 SET content_hash = NULL, hash_state = 'pending', hash_reason = NULL, chunk_count = 0
               WHERE chunk_count = 0",
@@ -958,9 +1386,14 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     conn.execute(
-        "INSERT INTO meta (key, value) VALUES ('schema_version', '2')
-         ON CONFLICT(key) DO UPDATE SET value = '2'",
-        [],
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![SCHEMA_VERSION.to_string()],
+    )?;
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('hash_algo_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![HASH_ALGO_VERSION],
     )?;
     Ok(())
 }
@@ -984,6 +1417,8 @@ fn row_to_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
         last_event_ts: r.get(14)?,
         created_at: r.get(15)?,
         opened_ts: r.get(16)?,
+        source_evidence: r.get(17)?,
+        source_strength: r.get(18)?,
     })
 }
 
@@ -1001,12 +1436,91 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
     })
 }
 
+/// Distinct-process summary for Q2, built once per detail request.
+///
+/// The three evidence kinds are kept apart on purpose: an ETW write, a live
+/// write handle, and a downloader task log say very different things, and the
+/// old code merged the last one into "N 个进程碰过它" even though that producer
+/// is a historical tool name, not a live process.
+#[derive(Debug, Default)]
+struct ProcessSummary {
+    etw_hits: i64,
+    live: Vec<(String, usize)>,
+    historical: Vec<(String, usize)>,
+    inferred: i64,
+    opened_ts: i64,
+}
+
+impl ProcessSummary {
+    fn digest(&self, ctx: &verdict::VerdictContext) -> verdict::ProcessDigest {
+        verdict::ProcessDigest {
+            etw_hits: self.etw_hits,
+            live: self.live.len() as i64,
+            historical: self.historical.len() as i64,
+            inferred: self.inferred,
+            etw_available: ctx.etw_available,
+        }
+    }
+}
+
+fn bump(list: &mut Vec<(String, usize)>, name: &str) {
+    match list.iter_mut().find(|(existing, _)| existing == name) {
+        Some(entry) => entry.1 += 1,
+        None => list.push((name.to_string(), 1)),
+    }
+}
+
+fn summarize_processes(versions: &[EventRow]) -> ProcessSummary {
+    let mut summary = ProcessSummary::default();
+    for ev in versions {
+        if ev.kind == "opened" {
+            if ev.ts > summary.opened_ts {
+                summary.opened_ts = ev.ts;
+            }
+            if ev.attribution == "recent-lnk" {
+                summary.inferred += 1;
+            }
+            continue;
+        }
+        let Some(process) = &ev.process_name else {
+            continue;
+        };
+        match ev.attribution.as_str() {
+            "etw" => {
+                summary.etw_hits += 1;
+                bump(&mut summary.live, process);
+            }
+            "download-task" => bump(&mut summary.historical, process),
+            "recent-lnk" => summary.inferred += 1,
+            _ => bump(&mut summary.live, process),
+        }
+    }
+    summary.live.sort_by(|a, b| b.1.cmp(&a.1));
+    summary.historical.sort_by(|a, b| b.1.cmp(&a.1));
+    summary
+}
+
+fn join_names(list: &[(String, usize)]) -> String {
+    list.iter()
+        .take(5)
+        .map(|(name, count)| format!("{}（{} 次）", name, count))
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_answers(
     file: &FileRow,
     versions: &[EventRow],
     copies: &[CopyRow],
     related: &[RelatedRow],
+    processes: &ProcessSummary,
+    total_events: i64,
+    distinct_processes: i64,
+    ctx: &verdict::VerdictContext,
+    safety: &verdict::SafetyDigest,
 ) -> Answers {
+    // ---- Q1: where did it come from -----------------------------------------
     let origin_headline = match file.source_kind.as_str() {
         "download" => "来自外部下载",
         "email" => "来自邮件",
@@ -1014,75 +1528,77 @@ fn build_answers(
         "local" => "本机生成",
         _ => "来源未知",
     };
-    let origin_conf = match file.source_kind.as_str() {
-        "download" | "email" | "im" => "high",
-        "local" => "medium",
-        _ => "low",
-    };
-    let origin_detail = file.source_detail.clone().unwrap_or_else(|| {
+    // Confidence comes from the evidence strength, never from the kind alone:
+    // "the path contains \Downloads\" used to be reported as high confidence.
+    let origin_conf = verdict::origin_confidence(&file.source_kind, file.source_strength);
+    let mut origin_detail = file.source_detail.clone().unwrap_or_else(|| {
         "没有找到任何来源记录。可能是很早以前就存在的文件，或由未接入适配器的数据源产生。".into()
     });
+    if file.source_strength <= 2 {
+        origin_detail.push_str(&format!(
+            "\n证据通道：{}（强度 {}），因此来源结论最高只能给到「{}」置信。",
+            if file.source_evidence.is_empty() {
+                "无"
+            } else {
+                file.source_evidence.as_str()
+            },
+            file.source_strength,
+            origin_conf
+        ));
+    }
 
     // ---- Q2: who touched it -------------------------------------------------
-    let mut proc_counts: Vec<(String, usize, String)> = Vec::new();
-    let mut opened_ts = 0i64;
-    let mut etw_hits = 0usize;
-    for ev in versions {
-        if ev.kind == "opened" {
-            if ev.ts > opened_ts {
-                opened_ts = ev.ts;
-            }
-            continue;
-        }
-        let Some(process) = &ev.process_name else {
-            continue;
-        };
-        if ev.attribution == "etw" {
-            etw_hits += 1;
-        }
-        match proc_counts.iter_mut().find(|(name, _, _)| name == process) {
-            Some(entry) => entry.1 += 1,
-            None => proc_counts.push((process.clone(), 1, ev.attribution.clone())),
-        }
-    }
-    proc_counts.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let (mod_headline, mut mod_detail, mod_conf) = if proc_counts.is_empty() {
-        (
-            "尚未捕获到写入进程".to_string(),
-            "文件出现或变化时没有拿到归属进程。常见原因：写入太快、进程已关闭句柄、或文件由扫描登记。\
-以管理员身份运行可启用 ETW 内核事件流，做到无遗漏归因。"
-                .to_string(),
-            "low".to_string(),
-        )
-    } else {
-        let names = proc_counts
-            .iter()
-            .take(5)
-            .map(|(name, count, _)| format!("{}（{} 次）", name, count))
-            .collect::<Vec<_>>()
-            .join("、");
-        let channel = if etw_hits > 0 {
-            "ETW 内核事件流"
+    let mod_conf = verdict::modifiers_confidence(&processes.digest(ctx));
+    let (mod_headline, mut mod_detail) = if !processes.live.is_empty() {
+        let channel = if processes.etw_hits > 0 {
+            "ETW 内核事件流（真·写入 PID）"
         } else {
-            "Windows Restart Manager 句柄归属"
+            "Restart Manager 写句柄（只证明写入者）"
         };
         (
-            format!("{} 个进程碰过它", proc_counts.len()),
             format!(
-                "按事件次数排序：{}。主要证据来自{}。\n时间线共 {} 条事件。",
-                names,
+                "{} 个进程碰过它",
+                distinct_processes.max(processes.live.len() as i64)
+            ),
+            format!(
+                "活进程写入者（按事件次数排序）：{}。\n主要证据来自{}。\n统计口径：全库共 {} 条事件；时间线只展示最近 {} 条。",
+                join_names(&processes.live),
                 channel,
+                total_events,
                 versions.len()
             ),
-            (if etw_hits > 0 { "high" } else { "medium" }).to_string(),
+        )
+    } else if !processes.historical.is_empty() {
+        (
+            "未捕获到活进程，但已确认产生者".to_string(),
+            format!(
+                "产生者（历史记录，不是当前活进程）：{}。\n\
+                 这类证据来自下载器任务日志：它能说明文件由哪个工具产生，但不能说明现在还有谁在动它。\n\
+                 统计口径：全库共 {} 条事件。",
+                join_names(&processes.historical),
+                total_events
+            ),
+        )
+    } else {
+        let why = if !ctx.platform_supports_etw {
+            "本平台没有 ETW / Restart Manager 等价通道，进程级归因不可用。"
+        } else if !ctx.etw_available {
+            "ETW 未启用（未提权或被配置关闭），句柄探测也没有抓到写入者。"
+        } else {
+            "写入太快、进程已关闭句柄，或文件由扫描登记。"
+        };
+        (
+            "尚未捕获到写入进程".to_string(),
+            format!(
+                "文件出现或变化时没有拿到归属进程。{}\n统计口径：全库共 {} 条事件。",
+                why, total_events
+            ),
         )
     };
-    if opened_ts > 0 {
+    if processes.opened_ts > 0 {
         mod_detail.push_str(&format!(
-            "\nShell「最近使用」记录显示它在 {} 被打开过（时间戳 {}）。",
-            human_relative(opened_ts),
-            opened_ts
+            "\nShell「最近使用」记录显示它在 {} 被打开过（按文件名匹配，属推断信号）。",
+            human_relative(processes.opened_ts)
         ));
     }
 
@@ -1094,84 +1610,91 @@ fn build_answers(
         .unwrap_or_default();
     let hardlinks: Vec<&CopyRow> = copies.iter().filter(|c| c.hardlink).collect();
     let real_copies: Vec<&CopyRow> = copies.iter().filter(|c| !c.hardlink).collect();
+    let safety_conf = verdict::safety_confidence(safety);
 
-    let (safety_headline, safety_detail, safety_conf) = match &file.content_hash {
-        None => (
+    let related_note = if related.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n另有 {} 个文件与它共享部分内容块（最多 {} 块），属于关联文件，不是副本。",
+            related.len(),
+            related.first().map(|r| r.shared_chunks).unwrap_or(0)
+        )
+    };
+
+    let (safety_headline, safety_detail) = if !safety.ready() {
+        (
             "内容指纹尚未生成".to_string(),
             format!(
                 "后台哈希队列状态：{}。完成后才能判断是否存在相同内容的其他副本。",
                 file.hash_state
             ),
-            "low".to_string(),
-        ),
-        Some(_) if copies.is_empty() => {
-            let extra = if file.source_kind == "download" {
-                "\n不过它被判定为下载产物，若原始 URL 仍有效，可以重新获取。"
-            } else {
-                ""
-            };
-            let related_note = if related.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n另有 {} 个文件与它共享部分内容块（最多 {} 块），可能是同一项目的关联文件。",
-                    related.len(),
-                    related.first().map(|r| r.shared_chunks).unwrap_or(0)
-                )
-            };
-            (
-                "唯一副本，删除会丢内容".to_string(),
-                format!(
-                    "在已监控目录中，BLAKE3 指纹 {}… 只出现一次（{}）。删除后本机不再有相同内容。{}{}",
-                    fingerprint,
-                    human_size(file.size),
-                    extra,
-                    related_note
-                ),
-                "high".to_string(),
-            )
+        )
+    } else if !real_copies.is_empty() {
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("内容完全相同的独立副本 {} 个：", real_copies.len()));
+        for copy in real_copies.iter().take(4) {
+            lines.push(format!("  · {}", copy.path));
         }
-        Some(_) => {
-            let mut lines: Vec<String> = Vec::new();
-            if !real_copies.is_empty() {
-                lines.push(format!("内容完全相同的独立副本 {} 个：", real_copies.len()));
-                for copy in real_copies.iter().take(4) {
-                    lines.push(format!("  · {}", copy.path));
-                }
-                if real_copies.len() > 4 {
-                    lines.push(format!("  · …另有 {} 处", real_copies.len() - 4));
-                }
-            }
-            if !hardlinks.is_empty() {
-                lines.push(format!(
-                    "硬链接 {} 个（同一个 FileID，磁盘上只有一份数据）：",
-                    hardlinks.len()
-                ));
-                for link in hardlinks.iter().take(4) {
-                    lines.push(format!("  · {}", link.path));
-                }
-            }
-            if !related.is_empty() {
-                lines.push(format!(
-                    "另有 {} 个文件共享部分内容块（最多 {} 块），属于关联文件而非副本。",
-                    related.len(),
-                    related.first().map(|r| r.shared_chunks).unwrap_or(0)
-                ));
-            }
-            let headline = match (real_copies.is_empty(), hardlinks.is_empty()) {
-                (false, _) => format!("还有 {} 个副本，删除不会丢内容", real_copies.len()),
-                (true, false) => format!(
-                    "只是 {} 个硬链接，删掉不释放空间也不丢内容",
-                    hardlinks.len()
-                ),
-                (true, true) => "删除不会丢内容".to_string(),
-            };
-            (
-                headline,
-                format!("BLAKE3 指纹 {}…：\n{}", fingerprint, lines.join("\n")),
-                "high".to_string(),
-            )
+        if real_copies.len() > 4 {
+            lines.push(format!("  · …另有 {} 处", real_copies.len() - 4));
         }
+        if !hardlinks.is_empty() {
+            lines.push(format!("另有 {} 个硬链接指向同一份数据。", hardlinks.len()));
+        }
+        (
+            format!("还有 {} 个副本，删除不会丢内容", real_copies.len()),
+            format!(
+                "BLAKE3 指纹 {}…：\n{}{}",
+                fingerprint,
+                lines.join("\n"),
+                related_note
+            ),
+        )
+    } else if !hardlinks.is_empty() {
+        let mut lines: Vec<String> = vec![format!(
+            "硬链接 {} 个（同一个 FileID，磁盘上只有一份数据）：",
+            hardlinks.len()
+        )];
+        for link in hardlinks.iter().take(4) {
+            lines.push(format!("  · {}", link.path));
+        }
+        (
+            format!(
+                "只是 {} 个硬链接，删掉不释放空间也不丢内容",
+                hardlinks.len()
+            ),
+            format!("{}{}", lines.join("\n"), related_note),
+        )
+    } else if safety.coverage_ok() {
+        // "Only copy" is only claimable when the fingerprint queue is empty:
+        // otherwise the very file that would have matched may simply not have
+        // been hashed yet.
+        let extra = if file.source_strength >= 3 {
+            "\n如果原始下载地址仍然有效，也可以重新获取该文件。"
+        } else {
+            ""
+        };
+        (
+            "唯一副本，删除会丢内容".to_string(),
+            format!(
+                "在已监控目录中，BLAKE3 指纹 {}… 只出现一次（{}），且库内没有未完成指纹的文件。删除后本机不再有相同内容。{}{}",
+                fingerprint,
+                human_size(file.size),
+                extra,
+                related_note
+            ),
+        )
+    } else {
+        (
+            "可能是唯一副本，但指纹覆盖不完整".to_string(),
+            format!(
+                "在已监控目录中，BLAKE3 指纹 {}… 暂时没有匹配到副本；但库内仍有 {} 个文件未完成指纹，其中可能包含相同内容。建议等指纹队列清空后再判断。{}",
+                fingerprint,
+                safety.pending_unhashed,
+                related_note
+            ),
+        )
     };
 
     Answers {
@@ -1183,14 +1706,32 @@ fn build_answers(
         modifiers: Answer {
             headline: mod_headline,
             detail: mod_detail,
-            confidence: mod_conf,
+            confidence: mod_conf.to_string(),
         },
         safety: Answer {
             headline: safety_headline,
             detail: safety_detail,
-            confidence: safety_conf,
+            confidence: safety_conf.to_string(),
         },
     }
+}
+
+/// The combined conclusion. Pure delegation to [`verdict::build`] so the rules
+/// stay testable outside the database layer.
+fn build_verdict(
+    file: &FileRow,
+    processes: &ProcessSummary,
+    ctx: &verdict::VerdictContext,
+    safety: &verdict::SafetyDigest,
+) -> Verdict {
+    verdict::build(&verdict::VerdictInput {
+        source_kind: file.source_kind.clone(),
+        source_strength: file.source_strength,
+        source_evidence: file.source_evidence.clone(),
+        processes: processes.digest(ctx),
+        safety: safety.clone(),
+        platform_supports_etw: ctx.platform_supports_etw,
+    })
 }
 
 fn human_relative(ts: i64) -> String {
@@ -1237,9 +1778,13 @@ fn build_graph(file: &FileRow, versions: &[EventRow], copies: &[CopyRow]) -> Gra
 
     // `opened` events are a different axis from content versions, so they are
     // folded into the version chain with their own label.
-    let chronological: Vec<&EventRow> = versions.iter().rev().take(12).collect();
+    //
+    // `versions` is newest-first; taking the *first* 12 and then reversing in
+    // place yields the most recent 12 in chronological order. (`rev().take(12)`
+    // — the previous code — silently selected the twelve *oldest* events.)
+    let chronological: Vec<&EventRow> = versions.iter().take(12).rev().collect();
     let mut prev: Option<String> = None;
-    let mut processes: Vec<String> = Vec::new();
+    let mut process_ids: Vec<String> = Vec::new();
     for (i, ev) in chronological.iter().enumerate() {
         let node = format!("ver:{}", ev.id);
         graph.nodes.push(GraphNode {
@@ -1259,14 +1804,16 @@ fn build_graph(file: &FileRow, versions: &[EventRow], copies: &[CopyRow]) -> Gra
         }
         if let Some(process) = &ev.process_name {
             let pid = format!("proc:{}", process.to_lowercase());
-            if !processes.contains(&pid) {
-                processes.push(pid.clone());
+            if !process_ids.contains(&pid) {
+                process_ids.push(pid.clone());
                 graph.nodes.push(GraphNode {
                     id: pid.clone(),
                     label: process.clone(),
                     kind: "process".into(),
                     sub: Some(if ev.attribution == "etw" {
                         "ETW 内核事件".into()
+                    } else if ev.attribution == "download-task" {
+                        "下载器任务记录（历史产生者）".into()
                     } else {
                         "持有写句柄".into()
                     }),

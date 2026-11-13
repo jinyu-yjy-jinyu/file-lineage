@@ -841,9 +841,10 @@ dependencies = [
 
 [[package]]
 name = "file-lineage"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "blake3",
+ "dirs",
  "ferrisetw",
  "notify",
  "rusqlite",

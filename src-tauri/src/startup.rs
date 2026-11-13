@@ -1,30 +1,40 @@
 //! Startup diagnostics.
 //!
-//! A release Windows GUI app (`windows_subsystem = "windows"`) has no console,
-//! so a panic or an early `return` looks exactly like "double-clicking does
-//! nothing". V2.0.0 shipped a database-migration bug that did precisely that.
+//! A release GUI app (`windows_subsystem = "windows"` on Windows) has no
+//! console, so a panic or an early `return` looks exactly like "double-clicking
+//! does nothing". V2.0.0 shipped a database-migration bug that did precisely
+//! that.
 //!
 //! This module makes every startup outcome observable:
 //!   * a small append-only `startup.log` next to the database;
 //!   * a panic hook that writes the panic payload there before delegating to
 //!     the default hook;
-//!   * `fatal()` which logs AND shows a modal error box, used for the two
+//!   * `fatal()` which logs AND tries to show a modal error box, used for the
 //!     fallible startup steps (database open, Tauri app build).
 //!
 //! Nothing here may panic: `log` is called from inside the panic hook.
+//!
+//! On Windows the modal is shown on a helper thread and waited on with a
+//! timeout, so a non-interactive session (service, scheduled task, session 0)
+//! cannot hang the process forever. On macOS/Linux `fatal` logs and writes to
+//! stderr: there is no portable modal, and a desktop app started from a
+//! terminal already gets a readable message.
 
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::win32 as w;
-
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Rotate the log when it grows past 512 KiB so a repeatedly failing install
 /// cannot fill the directory.
 const MAX_LOG_BYTES: u64 = 512 * 1024;
+
+/// How long `fatal` waits for the modal to be dismissed before continuing to
+/// shut down.
+#[cfg(windows)]
+const MODAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub fn init(data_dir: &Path) {
     let path = data_dir.join("startup.log");
@@ -53,21 +63,47 @@ pub fn log(message: &str) {
     let _ = writeln!(file, "{}  {}", crate::util::now_ms(), message);
 }
 
-/// Show a modal error and log it. Used when startup cannot continue.
+/// Report a fatal startup error and log it.
+#[cfg(windows)]
 pub fn fatal(title: &str, message: &str) {
     log(&format!(
         "FATAL: {} — {}",
         title,
         message.replace('\n', " | ")
     ));
-    unsafe {
-        let caption = crate::util::to_wide(std::ffi::OsStr::new(title));
-        let text = crate::util::to_wide(std::ffi::OsStr::new(message));
-        w::MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            caption.as_ptr(),
-            w::MB_OK | w::MB_ICONERROR | w::MB_SYSTEMMODAL,
-        );
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let owned_title = title.to_string();
+    let owned_message = message.to_string();
+    std::thread::Builder::new()
+        .name("fl-fatal".into())
+        .spawn(move || {
+            use crate::win32 as w;
+            unsafe {
+                let caption = crate::util::to_wide(std::ffi::OsStr::new(&owned_title));
+                let text = crate::util::to_wide(std::ffi::OsStr::new(&owned_message));
+                w::MessageBoxW(
+                    std::ptr::null_mut(),
+                    text.as_ptr(),
+                    caption.as_ptr(),
+                    w::MB_OK | w::MB_ICONERROR | w::MB_SYSTEMMODAL,
+                );
+            }
+            let _ = tx.send(());
+        })
+        .ok();
+    if rx.recv_timeout(MODAL_TIMEOUT).is_err() {
+        log("FATAL dialog still open after timeout; continuing to shutdown");
     }
+}
+
+/// Non-Windows fallback: log plus stderr. There is no portable modal dialog,
+/// and blocking a headless/session-less start forever would be worse.
+#[cfg(not(windows))]
+pub fn fatal(title: &str, message: &str) {
+    log(&format!(
+        "FATAL: {} — {}",
+        title,
+        message.replace('\n', " | ")
+    ));
+    eprintln!("FileLineage 启动失败：{}\n{}", title, message);
 }

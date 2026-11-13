@@ -8,9 +8,21 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Lowercased, forward-slashed path key used for lookups.
+/// Normalized path key used for lookups.
+///
+/// Windows filesystems are case-insensitive, so the key is lowercased. Unix
+/// filesystems are case-sensitive (macOS is a special case, but its source
+/// records use the on-disk spelling), so the original case is preserved there
+/// and only the separators are normalized — otherwise `/Users/A/File.txt` and
+/// `/users/a/file.txt` would be wrongly treated as the same file.
+#[cfg(windows)]
 pub fn path_key(p: &str) -> String {
     p.replace('/', "\\").to_lowercase()
+}
+
+#[cfg(not(windows))]
+pub fn path_key(p: &str) -> String {
+    p.replace('\\', "/")
 }
 
 /// File extension without the dot, lowercased.
@@ -70,8 +82,10 @@ pub fn should_skip_dir(name: &str) -> bool {
 
 /// NUL-terminated UTF-16 for Win32 `*W` entry points.
 ///
-/// This crate targets Windows only, so the platform module is used directly
-/// rather than behind `cfg` (fewer conditional-compilation mismatches).
+/// Windows-only: `std::os::windows` does not exist on other targets, so both
+/// helpers are compiled out entirely there. Their only callers (`win32.rs`
+/// users) are Windows-gated too.
+#[cfg(windows)]
 pub fn to_wide(value: &std::ffi::OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     value.encode_wide().chain(std::iter::once(0)).collect()
@@ -79,6 +93,7 @@ pub fn to_wide(value: &std::ffi::OsStr) -> Vec<u16> {
 
 /// Same, but with the `\\?\` prefix that lifts the 260-character MAX_PATH
 /// limit and disables path normalization (dot segments, trailing spaces).
+#[cfg(windows)]
 pub fn extended_path(path: &std::path::Path) -> Vec<u16> {
     let text = path.to_string_lossy();
     if text.starts_with(r"\\") {

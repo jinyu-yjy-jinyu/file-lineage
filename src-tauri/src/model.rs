@@ -12,6 +12,13 @@ pub struct FileRow {
     pub source_kind: String,
     pub source_label: String,
     pub source_detail: Option<String>,
+    /// Evidence channel id, e.g. `zone.ads` / `downloader.task` /
+    /// `browser.exact` / `browser.name_size` / `im.layout` / `mail.ext` /
+    /// `path.shape` / `rm.handle` / `none`.
+    pub source_evidence: String,
+    /// Evidence strength: 3 = objective/authoritative, 2 = strong indirect,
+    /// 1 = heuristic, 0 = none. Every confidence figure derives from this.
+    pub source_strength: i64,
     pub change_count: i64,
     pub created_at: i64,
     pub duplicate_count: i64,
@@ -121,6 +128,30 @@ pub struct Answers {
     pub safety: Answer,
 }
 
+/// Q1+Q2+Q3 folded into one conclusion with an explicit, derivable confidence.
+///
+/// Never assembled by string-concatenating the three answer cards: every field
+/// is computed from the evidence channels by `verdict::build`, which is a pure
+/// function covered by unit tests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Verdict {
+    /// One-line conclusion.
+    pub headline: String,
+    /// Why, in evidence terms.
+    pub detail: String,
+    /// high | medium | low
+    pub confidence: String,
+    /// 5..=97, derived from evidence strength (never hard-coded).
+    pub score: i64,
+    /// Evidence that pushed the score up.
+    pub drivers: Vec<String>,
+    /// Missing/weak channels and residuals the user must know about.
+    pub caveats: Vec<String>,
+    /// delete_safe | keep | verify_first
+    pub action: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileDetail {
@@ -130,6 +161,8 @@ pub struct FileDetail {
     pub related: Vec<RelatedRow>,
     pub graph: Graph,
     pub answers: Answers,
+    /// The combined conclusion shown after the three cards.
+    pub verdict: Verdict,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -164,6 +197,9 @@ pub struct Status {
     /// Events attributed by ETW rather than Restart Manager this session.
     pub etw_events: i64,
     pub autostart: bool,
+    /// The value stored in `config.ini` — not necessarily what the OS has
+    /// registered. `autostart` above is the registry/plist/desktop-file truth.
+    pub autostart_configured: bool,
     pub autostart_command: Option<String>,
     pub config_path: String,
     pub archived_events: i64,

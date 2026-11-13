@@ -1,30 +1,85 @@
-name: Build Windows Installer
+name: Build & Release
 
-# The installer is built ONLY on GitHub Actions, never on a developer machine.
-# V1 flow: commit -> push -> click "Run workflow" (one build per milestone).
+# Three-platform matrix. The bundling itself happens ONLY on GitHub Actions.
+# Flow: version-guard -> build (matrix, artifacts) -> release (single job).
+# A `check_only` dispatch runs cargo check per platform and stops before
+# bundling, so all three platforms' compile errors are collected in one run.
 on:
   workflow_dispatch:
     inputs:
       create_release:
-        description: "同时把安装包发布到 GitHub Release"
+        description: "同时把产物发布到 GitHub Release"
+        type: boolean
+        default: false
+      check_only:
+        description: "只跑 cargo check / cargo test（不打包、不发布）"
         type: boolean
         default: false
   push:
+    branches: [main]
     tags:
       - "v*"
-
-concurrency:
-  group: windows-installer-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
+  version-guard:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify version consistency
+        id: v
+        run: node scripts/check-version.mjs >> "$GITHUB_OUTPUT"
+
   build:
-    name: Build NSIS installer (x64)
-    runs-on: windows-latest
-    timeout-minutes: 75
+    name: Build ${{ matrix.artifact }}
+    needs: version-guard
+    strategy:
+      # Collect every platform's failure in one run instead of stopping at the
+      # first one.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            artifact: FileLineage-Windows-x64
+            bundles: nsis
+            shell: pwsh
+            timeout: 75
+            # Host target: x86_64 MSVC, installed by default.
+            rustup_targets: ""
+            bundle_flag: ""
+          - platform: macos-latest
+            artifact: FileLineage-macOS-universal
+            bundles: "app,dmg"
+            shell: bash
+            timeout: 90
+            # `universal-apple-darwin` is a Tauri bundler pseudo-target, NOT a
+            # rustup triple: install both real arches, and let the CLI drive
+            # the universal build via bundle_flag.
+            rustup_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+            bundle_flag: "--target universal-apple-darwin"
+          - platform: ubuntu-22.04
+            artifact: FileLineage-Linux-x64
+            bundles: "deb,appimage"
+            shell: bash
+            timeout: 75
+            rustup_targets: ""
+            bundle_flag: ""
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: ${{ matrix.timeout }}
+
+    # Job-level (not workflow-level): the `matrix` context is only available
+    # here, and per-platform groups keep a matrix run from cancelling its
+    # sibling platforms. Release builds are never cancelled mid-flight.
+    concurrency:
+      group: release-${{ github.ref }}-${{ matrix.platform }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -36,13 +91,23 @@ jobs:
           node-version: "20"
           cache: "npm"
 
-      - name: Install stable Rust (MSVC target)
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rustup_targets }}
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "src-tauri -> target"
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: Install frontend dependencies
         run: npm ci
@@ -50,62 +115,121 @@ jobs:
       # Makes cl.exe and the Windows SDK import libraries (rstrtmgr.lib,
       # kernel32.lib, ...) available to rustc / cc / link.exe.
       - name: Setup MSVC developer environment
+        if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Typecheck + build frontend
         run: npm run build
 
       # Fail fast with readable Rust diagnostics before the expensive bundling.
-      - name: Typecheck Rust crate
+      # Windows and Linux check the host target. macOS checks the *host* arch:
+      # `cargo check --target x86_64-apple-darwin` on the runner would still
+      # compile every crate and burn minutes; a host check catches cfg/module
+      # mistakes (the actual risk) without duplicating the bundle build.
+      - name: Cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
-      - name: Build Tauri installer
-        run: npm run tauri build
+      # Unit tests are pure logic (verdict scoring, schema migration); they run
+      # where a linker exists for test binaries and no GUI is required. On
+      # macOS the tests build for the *host* target: a universal test binary
+      # cannot be executed by the runner.
+      - name: Cargo test (lib)
+        if: runner.os != 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Bundle installers
+        if: ${{ !inputs.check_only }}
+        run: npm run tauri build -- --bundles ${{ matrix.bundles }} ${{ matrix.bundle_flag }}
         env:
           RUST_BACKTRACE: "1"
 
-      - name: Collect installer files
+      # A green build with zero installers is not a release: assert the exact
+      # bundle kinds each platform must produce.
+      - name: Assert artifacts exist (Windows)
+        if: ${{ !inputs.check_only && runner.os == 'Windows' }}
         shell: pwsh
         run: |
+          $bundle = "src-tauri\target\release\bundle"
+          $installers = @(Get-ChildItem -Path $bundle -Recurse -File -Include *.exe,*.msi -ErrorAction SilentlyContinue)
+          if ($installers.Count -eq 0) { throw "No Windows installer (.exe/.msi) was produced" }
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          $bundle = Join-Path $PWD "src-tauri\target\release\bundle"
-          if (-not (Test-Path $bundle)) { throw "No bundle directory was produced" }
-          Get-ChildItem -Path $bundle -Recurse -File -Include *.exe,*.msi | ForEach-Object {
-            Copy-Item $_.FullName -Destination artifacts
-            Write-Host "installer: $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)"
-          }
-          $count = (Get-ChildItem artifacts -File | Measure-Object).Count
-          if ($count -eq 0) { throw "No installer was produced" }
+          $installers | Copy-Item -Destination artifacts
           Get-ChildItem artifacts -File | Format-Table Name, Length
 
-      # Artifacts are a convenience; an exhausted account-level artifact
-      # quota must never invalidate an otherwise successful build.
-      - name: Upload installer artifact
+      - name: Assert artifacts exist (macOS)
+        if: ${{ !inputs.check_only && runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          mkdir -p artifacts
+          found=0
+          for f in src-tauri/target/**/bundle/dmg/*.dmg; do
+            cp "$f" artifacts/; found=1
+          done
+          for f in src-tauri/target/**/bundle/macos/*.app; do
+            ditto -c -k --sequesterRsrc --keepParent "$f" "artifacts/$(basename "$f").zip"; found=1
+          done
+          [ "$found" -eq 1 ] || { echo "No macOS .dmg/.app was produced"; exit 1; }
+          ls -la artifacts
+
+      - name: Assert artifacts exist (Linux)
+        if: ${{ !inputs.check_only && runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          mkdir -p artifacts
+          found=0
+          for f in src-tauri/target/**/bundle/deb/*.deb src-tauri/target/**/bundle/appimage/*.AppImage; do
+            chmod +x "$f" 2>/dev/null || true
+            cp "$f" artifacts/; found=1
+          done
+          [ "$found" -eq 1 ] || { echo "No Linux .deb/.AppImage was produced"; exit 1; }
+          ls -la artifacts
+
+      # Artifacts are a convenience; an exhausted account-level artifact quota
+      # must never invalidate an otherwise successful build.
+      - name: Upload build artifact
+        if: ${{ !inputs.check_only }}
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: FileLineage-Windows-x64
+          name: ${{ matrix.artifact }}
           path: artifacts/*
           if-no-files-found: error
           retention-days: 30
 
-      # Release assets are the durable delivery channel and are not billed
-      # against the Actions artifact storage quota.
+  # Exactly ONE release job writes the release: three concurrent gh-release
+  # calls against the same tag used to 422 and overwrite each other's assets.
+  release:
+    needs: build
+    if: ${{ !cancelled() && !failure() && !inputs.check_only && (startsWith(github.ref, 'refs/tags/v') || inputs.create_release == true) }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assert deliverables are present
+        run: |
+          set -euo pipefail
+          ls -la dist
+          count=$(find dist -type f | wc -l)
+          [ "$count" -ge 3 ] || { echo "Expected at least 3 platform deliverables, found $count"; exit 1; }
+
       - name: Publish GitHub Release
-        if: ${{ !cancelled() && (inputs.create_release || startsWith(github.ref, 'refs/tags/v')) }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v0.2.2-{0}', github.run_number) }}
-          name: FileLineage V2.0.2
-          body: |
-            Windows x64 安装包（NSIS）。
-
-            V2.0.2：新增第三方下载器来源适配器（Ghost Downloader tasks.jsonl），
-            能回答「这个文件由哪个下载器、从哪个 URL、在什么时候产生」，
-            并回填安装前已下载文件的来源与时间线；修正过时的界面说明文案。
-
-            V2 功能：常驻托盘 + 开机自启 + 单实例；ETW 真·进程级归因（需管理员）、
-            Zone.Identifier 来源证据、卷号 + FileID 文件身份、分块 BLAKE3、
-            部分相同判定、90 天事件冷热归档、Shell 打开记录。
-            数据全部保存在本机 SQLite，不上传任何内容。
-          files: artifacts/*
+          tag_name: v${{ needs.version-guard.outputs.version }}
+          name: FileLineage v${{ needs.version-guard.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*

@@ -10,8 +10,10 @@
 //! treated as soft evidence and is labelled as such in the UI text.
 
 use std::collections::HashMap;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
 use crate::util::millis;
 
 #[derive(Debug, Default)]
@@ -24,7 +26,24 @@ pub struct Recent {
 }
 
 impl Recent {
+    /// Windows reads the shell's `.lnk` shortcut folder. macOS/Linux have no
+    /// equivalent shortcut folder that maps a shortcut name back to a tracked
+    /// file, so this degrades to an *empty, not loaded* adapter: the collector
+    /// then simply does not advertise an opening-record channel (rather than
+    /// advertising one that always answers zero).
     pub fn load() -> Self {
+        #[cfg(windows)]
+        {
+            Self::load_windows()
+        }
+        #[cfg(not(windows))]
+        {
+            Recent::default()
+        }
+    }
+
+    #[cfg(windows)]
+    fn load_windows() -> Self {
         let mut recent = Recent::default();
         let Some(dir) = recent_dir() else {
             recent.loaded = true;
@@ -94,6 +113,7 @@ impl Recent {
     }
 }
 
+#[cfg(windows)]
 pub fn recent_dir() -> Option<PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
     let dir = Path::new(&appdata)

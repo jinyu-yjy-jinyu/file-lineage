@@ -1,5 +1,7 @@
 import { useEffect, useRef } from "react";
 
+import { truncateChars } from "../format";
+import { graphPalette } from "../theme";
 import type { Graph, GraphNode } from "../types";
 
 interface Particle {
@@ -10,21 +12,6 @@ interface Particle {
   vy: number;
   node: GraphNode;
 }
-
-const NODE_COLORS: Record<string, string> = {
-  source: "#ffb25c",
-  file: "#56d6c8",
-  version: "#7a9cc0",
-  process: "#9f8cff",
-  copy: "#6fcf97",
-};
-
-const EDGE_COLORS: Record<string, string> = {
-  origin: "rgba(255,178,92,0.55)",
-  evolve: "rgba(122,156,192,0.55)",
-  touch: "rgba(159,140,255,0.60)",
-  copy: "rgba(111,207,151,0.60)",
-};
 
 function radiusOf(weight: number): number {
   return 9 + Math.min(weight, 3) * 4;
@@ -37,6 +24,10 @@ export function LineageGraph({ graph }: { graph: Graph }) {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || graph.nodes.length === 0) return;
+
+    // Colours come from the CSS custom properties (single source of truth with
+    // the DOM legend in `App.tsx`, see `src/theme.ts`).
+    const palette = graphPalette();
 
     let particles: Particle[] = [];
     let width = 320;
@@ -114,8 +105,8 @@ export function LineageGraph({ graph }: { graph: Graph }) {
       for (const p of particles) {
         p.vx += (width / 2 - p.x) * 0.006;
         p.vy += (height / 2 - p.y) * 0.006;
-        p.vx *= 0.80;
-        p.vy *= 0.80;
+        p.vx *= 0.8;
+        p.vy *= 0.8;
         p.x += Math.max(-8, Math.min(8, p.vx)) * alpha;
         p.y += Math.max(-8, Math.min(8, p.vy)) * alpha;
         const pad = 34;
@@ -134,7 +125,7 @@ export function LineageGraph({ graph }: { graph: Graph }) {
         const a = byId.get(edge.from);
         const b = byId.get(edge.to);
         if (!a || !b) continue;
-        const stroke = EDGE_COLORS[edge.kind] ?? "rgba(122,156,192,0.5)";
+        const stroke = palette.edges[edge.kind] ?? palette.edges.evolve;
         ctx.strokeStyle = stroke;
         ctx.lineWidth = edge.kind === "origin" ? 1.8 : 1.2;
         ctx.beginPath();
@@ -163,10 +154,10 @@ export function LineageGraph({ graph }: { graph: Graph }) {
 
       for (const p of particles) {
         const r = radiusOf(p.node.weight);
-        const color = NODE_COLORS[p.node.kind] ?? "#7a9cc0";
+        const color = palette.nodes[p.node.kind] ?? palette.nodes.version;
         ctx.beginPath();
         ctx.arc(p.x, p.y, r + 5, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(10,17,28,0.92)";
+        ctx.fillStyle = palette.halo;
         ctx.fill();
         ctx.beginPath();
         ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
@@ -180,11 +171,10 @@ export function LineageGraph({ graph }: { graph: Graph }) {
 
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
-        ctx.font = "11px system-ui, -apple-system, 'Segoe UI', sans-serif";
-        ctx.fillStyle = "#d6e2f0";
-        const label =
-          p.node.label.length > 18 ? `${p.node.label.slice(0, 17)}…` : p.node.label;
-        ctx.fillText(label, p.x, p.y + r + 6);
+        ctx.font =
+          "11px Inter, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif";
+        ctx.fillStyle = palette.label;
+        ctx.fillText(truncateChars(p.node.label, 18), p.x, p.y + r + 6);
       }
     };
 
@@ -207,5 +197,30 @@ export function LineageGraph({ graph }: { graph: Graph }) {
     };
   }, [graph]);
 
-  return <canvas className="graph-canvas" ref={canvasRef} />;
+  if (graph.nodes.length === 0) {
+    return (
+      <p className="graph-empty muted small">
+        还没有可用于绘图的证据节点：等采集到来源或写入事件后这里会出现血缘图。
+      </p>
+    );
+  }
+
+  return (
+    <>
+      <canvas
+        className="graph-canvas"
+        ref={canvasRef}
+        aria-hidden="true"
+        role="presentation"
+      />
+      <p className="graph-summary muted small">
+        {graph.nodes.length} 个节点、{graph.edges.length} 条关系：
+        {graph.nodes
+          .slice(0, 6)
+          .map((node) => node.label)
+          .join("、")}
+        {graph.nodes.length > 6 ? " …" : ""}
+      </p>
+    </>
+  );
 }

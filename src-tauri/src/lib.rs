@@ -8,11 +8,14 @@ mod fingerprint;
 mod identity;
 mod im_layout;
 mod model;
+mod platform;
 mod recent;
 mod runtime;
 mod sources;
 mod startup;
 mod util;
+mod verdict;
+#[cfg(windows)]
 mod win32;
 mod zoneid;
 
@@ -45,31 +48,41 @@ pub struct AppState {
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, AppState>) -> Status {
-    let counts = state.store.counts();
+    // The status endpoint is polled continuously; `stats()` caches the
+    // expensive aggregates (counts, archive sizes) for a few seconds instead of
+    // re-running seven subqueries — including `COUNT(*) FROM chunks` — on every
+    // poll.
+    let stats = state.store.stats(5_000);
     let mut snapshot = state
         .status
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default();
 
-    snapshot.file_count = counts.files;
-    snapshot.event_count = counts.events;
-    snapshot.hashed_count = counts.hashed;
-    snapshot.pending_hash = counts.pending;
-    snapshot.identified_files = counts.identified;
-    snapshot.chunk_count = counts.chunks;
-    snapshot.incremental_hashes = counts.incremental;
+    snapshot.file_count = stats.counts.files;
+    snapshot.event_count = stats.counts.events;
+    snapshot.hashed_count = stats.counts.hashed;
+    snapshot.pending_hash = stats.counts.pending;
+    snapshot.identified_files = stats.counts.identified;
+    snapshot.chunk_count = stats.counts.chunks;
+    snapshot.incremental_hashes = stats.counts.incremental;
 
     snapshot.db_path = state.store.db_path.to_string_lossy().to_string();
-    snapshot.db_size = state.store.db_size();
-    snapshot.total_db_size = state.store.total_size();
-    snapshot.archived_events = state.store.archived_event_count();
-    snapshot.archive_files = state.store.archive_file_count();
+    snapshot.db_size = stats.db_size;
+    snapshot.total_db_size = stats.total_db_size;
+    snapshot.archived_events = stats.archived_events;
+    snapshot.archive_files = stats.archive_files;
     snapshot.autostart_command = runtime::autostart_command();
     snapshot.config_path = state.config_path.to_string_lossy().to_string();
-    snapshot.schema_version = 2;
+    snapshot.schema_version = state.store.schema_version();
     if let Ok(config) = state.config.lock() {
-        snapshot.autostart = config.autostart;
+        snapshot.autostart_configured = config.autostart;
+    }
+    // H6: the OS entry is the truth, not the config file. Reporting the config
+    // value made the UI announce "已开机自启" while the registry had no entry.
+    snapshot.autostart = runtime::autostart_enabled();
+    if let Some(error) = state.store.last_error() {
+        snapshot.last_error = Some(error);
     }
     snapshot
 }
@@ -77,18 +90,36 @@ fn get_status(state: tauri::State<'_, AppState>) -> Status {
 #[tauri::command]
 fn list_files(
     query: String,
+    kind: String,
     limit: i64,
     offset: i64,
     state: tauri::State<'_, AppState>,
 ) -> Vec<FileRow> {
     state
         .store
-        .list_files(&query, limit.clamp(1, 500), offset.max(0))
+        .list_files(&query, &kind, limit.clamp(1, 500), offset.max(0))
+}
+
+/// Total row count for the current filter, so the header can show "X / Y".
+#[tauri::command]
+fn count_files(query: String, kind: String, state: tauri::State<'_, AppState>) -> i64 {
+    state.store.count_files(&query, &kind)
 }
 
 #[tauri::command]
 fn get_file_detail(id: i64, state: tauri::State<'_, AppState>) -> Option<FileDetail> {
-    state.store.file_detail(id)
+    // The verdict needs to know whether ETW actually answered this session:
+    // "ETW configured but not elevated" is a caveat, not a free downgrade.
+    let etw_available = state
+        .status
+        .lock()
+        .map(|status| status.etw_state == "active")
+        .unwrap_or(false);
+    let ctx = crate::verdict::VerdictContext {
+        etw_available,
+        platform_supports_etw: cfg!(windows),
+    };
+    state.store.file_detail(id, &ctx)
 }
 
 #[tauri::command]
@@ -97,32 +128,8 @@ fn rescan(state: tauri::State<'_, AppState>) {
 }
 
 #[tauri::command]
-fn reveal(path: String) {
-    // Explorer wants a single `/select,<path>` argument.
-    let _ = std::process::Command::new("explorer")
-        .arg(format!("/select,{}", path))
-        .spawn();
-}
-
-fn watch_dirs() -> Vec<PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let mut dirs = Vec::new();
-    for name in ["Downloads", "Desktop", "Documents"] {
-        let candidate = home.join(name);
-        if candidate.is_dir() {
-            dirs.push(candidate);
-        }
-    }
-    // OneDrive-redirected folders are common on Chinese Windows installs.
-    for name in ["OneDrive\\Downloads", "OneDrive\\Desktop", "OneDrive\\文档"] {
-        let candidate = home.join(name);
-        if candidate.is_dir() {
-            dirs.push(candidate);
-        }
-    }
-    dirs
+fn reveal(path: String) -> Result<(), String> {
+    platform::reveal(&path)
 }
 
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -175,21 +182,45 @@ fn build_tray<R: tauri::Runtime>(
             "tray_autostart" => {
                 let current = autostart_handle.is_checked().unwrap_or(false);
                 let next = !current;
-                let applied = std::env::current_exe()
-                    .ok()
-                    .map(|exe| runtime::set_autostart(next, &exe).is_ok())
-                    .unwrap_or(false);
-                if !applied {
+                let exe = std::env::current_exe().ok();
+                let applied = match exe.as_deref() {
+                    Some(path) => runtime::set_autostart(next, path),
+                    None => Err("无法获取当前可执行文件路径".to_string()),
+                };
+                if let Err(error) = applied {
+                    // The OS entry did not change: keep the checkbox where it
+                    // was and surface the reason.
+                    let message = format!("开机自启切换失败：{}", error);
+                    startup::log(&message);
+                    let state = app.state::<AppState>();
+                    if let Ok(mut status) = state.status.lock() {
+                        status.last_error = Some(message);
+                    }
                     return;
                 }
                 let _ = autostart_handle.set_checked(next);
-                let _ = config::write_bool(&config_path, "autostart", next);
+                if let Err(error) = config::write_bool(&config_path, "autostart", next) {
+                    // Roll the OS entry back so the checkbox never claims a
+                    // state that was not persisted.
+                    if let Some(path) = exe.as_deref() {
+                        let _ = runtime::set_autostart(current, path);
+                    }
+                    let _ = autostart_handle.set_checked(current);
+                    let message = format!("开机自启配置写入失败：{}", error);
+                    startup::log(&message);
+                    let state = app.state::<AppState>();
+                    if let Ok(mut status) = state.status.lock() {
+                        status.last_error = Some(message);
+                    }
+                    return;
+                }
                 let state = app.state::<AppState>();
                 if let Ok(mut config) = state.config.lock() {
                     config.autostart = next;
                 }
                 if let Ok(mut status) = state.status.lock() {
                     status.autostart = next;
+                    status.autostart_configured = next;
                 };
             }
             "tray_quit" => app.exit(0),
@@ -212,13 +243,16 @@ fn build_tray<R: tauri::Runtime>(
 pub fn run() {
     // Diagnostics are installed before anything that can fail. A release GUI
     // binary has no console, so without startup.log a failure is invisible.
-    let base = std::env::var("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let data_dir = base.join("FileLineage");
+    //
+    // `platform::data_dir()` is `%LOCALAPPDATA%\FileLineage` on Windows (exactly
+    // the old path, so existing installs keep their database) and the platform's
+    // local app-data root everywhere else. The old `temp_dir()` fallback put the
+    // database in a world-readable, reboot-cleared `/tmp/FileLineage` on macOS
+    // and Linux.
+    let data_dir = platform::data_dir();
     if let Err(error) = std::fs::create_dir_all(&data_dir) {
-        // `fatal` logs when it can, but always shows a modal — worth calling
-        // even before `startup::init` has installed the log path.
+        // `fatal` logs when it can, but always reports — worth calling even
+        // before `startup::init` has installed the log path.
         startup::fatal(
             "FileLineage 启动失败",
             &format!("无法创建数据目录：{}\n\n{}", data_dir.display(), error),
@@ -257,7 +291,8 @@ pub fn run() {
             return;
         }
     };
-    let dirs = watch_dirs();
+    let dirs = platform::watch_dirs();
+    store.set_watch_dirs(dirs.clone());
     let minimized = std::env::args().any(|arg| arg == runtime::MINIMIZED_FLAG);
 
     let status = Arc::new(Mutex::new(Status {
@@ -271,18 +306,28 @@ pub fn run() {
         scan_state: "idle".to_string(),
         elevated: runtime::is_elevated(),
         etw_state: "starting".to_string(),
-        autostart: config.autostart,
+        autostart: runtime::autostart_enabled(),
+        autostart_configured: config.autostart,
         ..Default::default()
     }));
 
-    // Keep the login entry in sync with the configuration.
+    // Keep the login entry in sync with the configuration. A failure is a real
+    // user-visible problem ("配置说开了，其实没开"), so it is written to both the
+    // status and startup.log instead of being dropped.
     if let Ok(exe) = std::env::current_exe() {
-        if config.autostart {
-            if !runtime::autostart_enabled() {
-                let _ = runtime::set_autostart(true, &exe);
+        let desired = config.autostart;
+        let current = runtime::autostart_enabled();
+        if desired != current {
+            if let Err(error) = runtime::set_autostart(desired, &exe) {
+                let message = format!(
+                    "开机自启与配置不一致且同步失败（配置 {}，注册表 {}）：{}",
+                    desired, current, error
+                );
+                startup::log(&message);
+                if let Ok(mut guard) = status.lock() {
+                    guard.last_error = Some(message);
+                }
             }
-        } else if runtime::autostart_enabled() {
-            let _ = runtime::set_autostart(false, &exe);
         }
     }
 
@@ -343,6 +388,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             list_files,
+            count_files,
             get_file_detail,
             rescan,
             reveal

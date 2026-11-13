@@ -9,6 +9,11 @@ export function formatBytes(n: number): string {
   return i === 0 ? `${n} B` : `${v.toFixed(1)} ${units[i]}`;
 }
 
+/**
+ * Local wall-clock time. The backend never hand-formats timestamps in prose
+ * (it appends an explicit `UTC` label where it must, e.g. browser download
+ * times), so a single event can no longer appear as two different moments.
+ */
 export function formatTime(ms: number): string {
   if (!ms || ms <= 0) return "—";
   const d = new Date(ms);
@@ -36,7 +41,19 @@ export function basename(path: string): string {
 }
 
 export function shortPath(path: string): string {
-  return path.replace(/^C:\\Users\\[^\\]+\\/i, "~\\");
+  return path.replace(/^[A-Z]:\\Users\\[^\\]+\\/i, "~\\");
+}
+
+/** UTF-16-safe truncation: `slice` can split a surrogate pair (L17). */
+export function truncateChars(text: string, max: number): string {
+  const chars = Array.from(text);
+  return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : text;
+}
+
+export function confidenceLabel(confidence: string): string {
+  if (confidence === "high") return "高置信";
+  if (confidence === "medium") return "中置信";
+  return "低置信";
 }
 
 export const sourceMeta: Record<string, { label: string; className: string }> = {
@@ -53,4 +70,20 @@ export const eventLabel: Record<string, string> = {
   renamed: "重命名",
   removed: "删除",
   observed: "首次登记",
+  opened: "被打开",
+  downloaded: "下载",
 };
+
+/** How an event got its process, rendered as a small badge in the timeline. */
+export const attributionLabel: Record<string, string> = {
+  etw: "ETW 写入",
+  "restart-manager": "写句柄",
+  "download-task": "下载器记录",
+  "recent-lnk": "推断",
+  baseline: "基线",
+  unknown: "无归因",
+};
+
+export function isInferredAttribution(attribution: string): boolean {
+  return attribution === "recent-lnk";
+}

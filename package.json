@@ -1,7 +1,7 @@
 {
   "name": "file-lineage",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.3.0",
   "type": "module",
   "description": "文件因果溯源台 — 给每个文件回答三个问题：它从哪来、经过谁的手、现在还有没有用。",
   "scripts": {

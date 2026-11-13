@@ -871,7 +871,7 @@ impl Store {
                 }
             }
         }
-        let (archived_total, _) = self.with_archives(|list| {
+        let archived_total = self.with_archives(|list| {
             let mut count = 0i64;
             for (_, conn) in list {
                 count += conn

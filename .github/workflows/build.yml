@@ -78,16 +78,21 @@ jobs:
           if ($count -eq 0) { throw "No installer was produced" }
           Get-ChildItem artifacts -File | Format-Table Name, Length
 
+      # Artifacts are a convenience; an exhausted account-level artifact
+      # quota must never invalidate an otherwise successful build.
       - name: Upload installer artifact
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: FileLineage-Windows-x64
           path: artifacts/*
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 30
 
+      # Release assets are the durable delivery channel and are not billed
+      # against the Actions artifact storage quota.
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.create_release
+        if: ${{ !cancelled() && (inputs.create_release || startsWith(github.ref, 'refs/tags/v')) }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v0.1.0-{0}', github.run_number) }}

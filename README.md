@@ -74,9 +74,12 @@
 **本机不构建安装包。** 本机只负责写代码、提交、推送；编译与 NSIS 打包全部在 `windows-latest` runner 上完成。
 
 1. 打开仓库 **Actions → Build Windows Installer → Run workflow**。
+   - 建议勾选 `create_release`：安装包会同时发布到 **Releases**，得到永久下载链接（Release 资源不占用 Actions Artifact 存储配额）。
 2. 等约 10–20 分钟（首次要编译 Rust 依赖）。
-3. 在该次 run 的 **Artifacts** 里下载 `FileLineage-Windows-x64`，得到 `FileLineage_0.1.0_x64-setup.exe`。
-4. 推送 `v*` tag，或在手动运行时勾选 `create_release`，会把安装包一并发布到 GitHub Release。
+3. 下载位置二选一：
+   - **Releases** → `FileLineage_x64-setup.exe`（推荐，长期保留）；
+   - 该次 run 的 **Artifacts** → `FileLineage-Windows-x64`（保留 30 天，若账户 Artifact 配额耗尽则该步会被跳过，但不影响构建结果）。
+4. 推送 `v*` tag 会自动触发构建并自动发布 Release。
 
 工作流见 [.github/workflows/build.yml](./.github/workflows/build.yml)。产物为 NSIS 单用户安装（`currentUser`），无需代码签名即可本机安装；Windows SmartScreen 对未签名新应用可能给出提示，选择「仍要运行」即可。
 

@@ -1,6 +1,6 @@
 [package]
 name = "file-lineage"
-version = "0.2.0"
+version = "0.2.1"
 description = "文件因果溯源台 — file causality & lineage for Windows"
 authors = ["FileLineage"]
 edition = "2021"

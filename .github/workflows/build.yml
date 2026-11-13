@@ -95,12 +95,17 @@ jobs:
         if: ${{ !cancelled() && (inputs.create_release || startsWith(github.ref, 'refs/tags/v')) }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v0.2.0-{0}', github.run_number) }}
-          name: FileLineage V2
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v0.2.1-{0}', github.run_number) }}
+          name: FileLineage V2.0.1
           body: |
             Windows x64 安装包（NSIS）。
 
-            V2：常驻托盘 + 开机自启 + 单实例；ETW 真·进程级归因（需管理员）、
+            V2.0.1 热修：修复从 V1 升级后无法启动的问题（V1 数据库缺少
+            V2 列时，建索引先于列迁移导致 SQLite 报错并静默退出）。
+            现在建表 -> 迁移补列 -> 建索引，且启动失败会写
+            %LOCALAPPDATA%\FileLineage\startup.log 并弹出可见错误框。
+
+            V2 功能：常驻托盘 + 开机自启 + 单实例；ETW 真·进程级归因（需管理员）、
             Zone.Identifier 来源证据、卷号 + FileID 文件身份、分块 BLAKE3、
             部分相同判定、90 天事件冷热归档、Shell 打开记录。
             前端界面与 V1 一致，界面改版留到 V3。

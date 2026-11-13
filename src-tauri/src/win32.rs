@@ -31,6 +31,10 @@ pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub const SW_SHOW: i32 = 5;
 pub const SW_RESTORE: i32 = 9;
 
+pub const MB_OK: u32 = 0x0;
+pub const MB_ICONERROR: u32 = 0x10;
+pub const MB_SYSTEMMODAL: u32 = 0x1000;
+
 /// `TOKEN_INFORMATION_CLASS::TokenElevation`
 pub const TOKEN_ELEVATION_CLASS: u32 = 20;
 pub const TOKEN_QUERY: u32 = 0x0008;
@@ -131,6 +135,8 @@ extern "system" {
     pub fn IsIconic(window: Handle) -> Bool;
     pub fn ShowWindow(window: Handle, command: i32) -> Bool;
     pub fn SetForegroundWindow(window: Handle) -> Bool;
+
+    pub fn MessageBoxW(window: Handle, text: *const u16, caption: *const u16, kind: u32) -> i32;
 }
 
 #[link(name = "advapi32")]

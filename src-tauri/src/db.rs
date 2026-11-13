@@ -48,7 +48,15 @@ impl FileObservation {
     }
 }
 
-const SCHEMA: &str = r#"
+/// Phase 1 — tables only.
+///
+/// This must NEVER reference a column that `migrate` may still have to add.
+/// On a V1 database `CREATE TABLE IF NOT EXISTS` is a no-op, so an index over
+/// a V2 column here fails the whole `execute_batch` and, because the caller
+/// used `expect`, kills the GUI process with no visible error. V2.0.0 shipped
+/// exactly that bug: `idx_files_identity` referenced `volume_serial` before
+/// the column existed. Indexes therefore live in [`SCHEMA_INDEXES`].
+const SCHEMA_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -76,10 +84,6 @@ CREATE TABLE IF NOT EXISTS files (
     chunk_count   INTEGER NOT NULL DEFAULT 0,
     opened_ts     INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
-CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
-CREATE INDEX IF NOT EXISTS idx_files_seen ON files(last_seen_at);
-CREATE INDEX IF NOT EXISTS idx_files_identity ON files(volume_serial, file_index);
 
 CREATE TABLE IF NOT EXISTS events (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,9 +97,6 @@ CREATE TABLE IF NOT EXISTS events (
     attribution   TEXT    NOT NULL DEFAULT 'unknown',
     note          TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_events_file ON events(file_id, ts DESC);
-CREATE INDEX IF NOT EXISTS idx_events_proc ON events(process_name);
-CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(ts);
 
 CREATE TABLE IF NOT EXISTS chunks (
     file_id INTEGER NOT NULL,
@@ -103,6 +104,18 @@ CREATE TABLE IF NOT EXISTS chunks (
     hash    TEXT    NOT NULL,
     PRIMARY KEY (file_id, idx)
 );
+"#;
+
+/// Phase 3 — indexes. Executed only after `migrate` has guaranteed that every
+/// referenced column exists on both fresh and upgraded databases.
+const SCHEMA_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
+CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
+CREATE INDEX IF NOT EXISTS idx_files_seen ON files(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_files_identity ON files(volume_serial, file_index);
+CREATE INDEX IF NOT EXISTS idx_events_file ON events(file_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_events_proc ON events(process_name);
+CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
 "#;
 
@@ -208,8 +221,9 @@ impl Store {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(SCHEMA_TABLES)?;
         migrate(&conn)?;
+        conn.execute_batch(SCHEMA_INDEXES)?;
 
         let archive_dir = path
             .parent()

@@ -10,6 +10,7 @@ mod model;
 mod recent;
 mod runtime;
 mod sources;
+mod startup;
 mod util;
 mod win32;
 mod zoneid;
@@ -208,22 +209,53 @@ fn build_tray<R: tauri::Runtime>(
 }
 
 pub fn run() {
-    // A second launch must not start a second collector: hand the window over
-    // to the resident instance and leave.
-    let Some(_instance) = runtime::acquire_single_instance() else {
-        runtime::focus_existing_window(WINDOW_TITLE);
-        return;
-    };
-
+    // Diagnostics are installed before anything that can fail. A release GUI
+    // binary has no console, so without startup.log a failure is invisible.
     let base = std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
     let data_dir = base.join("FileLineage");
-    let _ = std::fs::create_dir_all(&data_dir);
+    if let Err(error) = std::fs::create_dir_all(&data_dir) {
+        // `fatal` logs when it can, but always shows a modal — worth calling
+        // even before `startup::init` has installed the log path.
+        startup::fatal(
+            "FileLineage 启动失败",
+            &format!("无法创建数据目录：{}\n\n{}", data_dir.display(), error),
+        );
+        return;
+    }
+    startup::init(&data_dir);
+
+    // A second launch must not start a second collector: hand the window over
+    // to the resident instance and leave.
+    let Some(_instance) = runtime::acquire_single_instance() else {
+        startup::log("second instance detected -> handing off to resident window");
+        runtime::focus_existing_window(WINDOW_TITLE);
+        return;
+    };
+
     let db_path = data_dir.join("lineage.db");
     let (config, config_path) = Config::load(&data_dir);
+    startup::log("config loaded");
 
-    let store = Arc::new(db::Store::open(&db_path).expect("failed to open the lineage database"));
+    let store = match db::Store::open(&db_path) {
+        Ok(store) => {
+            startup::log("database opened / migration ok");
+            Arc::new(store)
+        }
+        Err(error) => {
+            startup::fatal(
+                "FileLineage 启动失败",
+                &format!(
+                    "无法打开本地数据库（或升级旧版本数据）。\n\n{}\n\n数据文件：{}\n诊断日志：{}",
+                    error,
+                    db_path.display(),
+                    data_dir.join("startup.log").display()
+                ),
+            );
+            return;
+        }
+    };
     let dirs = watch_dirs();
     let minimized = std::env::args().any(|arg| arg == runtime::MINIMIZED_FLAG);
 
@@ -263,8 +295,9 @@ pub fn run() {
     let starter = Arc::clone(&collector);
     let config_state = Arc::new(Mutex::new(config));
     let tray_config_path = config_path.clone();
+    let tray_log_path = data_dir.join("startup.log");
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(AppState {
             store,
             collector,
@@ -279,7 +312,22 @@ pub fn run() {
                 }
             }
             starter.start();
-            build_tray(app, tray_config_path.clone())?;
+            // Tauri 2 runs `setup` on the Ready event inside `App::run`, NOT
+            // inside `Builder::build`. A setup error becomes a main-thread
+            // panic, so `Builder::build`'s Err arm cannot catch it — surface
+            // it here before returning.
+            if let Err(error) = build_tray(app, tray_config_path.clone()) {
+                startup::fatal(
+                    "FileLineage 启动失败",
+                    &format!(
+                        "无法创建托盘图标或菜单。\n\n{}\n\n诊断日志：{}",
+                        error,
+                        tray_log_path.display()
+                    ),
+                );
+                return Err(error.into());
+            }
+            startup::log("setup ok / tray built / collector started");
             Ok(())
         })
         .on_window_event(move |window, event| {
@@ -298,16 +346,34 @@ pub fn run() {
             rescan,
             reveal
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(move |_app, event| {
-            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
-                // Keep running when the last window closes, but let an explicit
-                // `app.exit(0)` (the tray's 退出 item) through. When the user
-                // disabled minimize-to-tray, closing the window really exits.
-                if code.is_none() && minimize_to_tray {
-                    api.prevent_exit();
-                }
+        .build(tauri::generate_context!());
+
+    let app = match app {
+        Ok(app) => {
+            startup::log("tauri app built / entering event loop");
+            app
+        }
+        Err(error) => {
+            startup::fatal(
+                "FileLineage 启动失败",
+                &format!(
+                    "无法创建应用窗口或托盘。\n\n{}\n\n诊断日志：{}",
+                    error,
+                    data_dir.join("startup.log").display()
+                ),
+            );
+            return;
+        }
+    };
+
+    app.run(move |_app, event| {
+        if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+            // Keep running when the last window closes, but let an explicit
+            // `app.exit(0)` (the tray's 退出 item) through. When the user
+            // disabled minimize-to-tray, closing the window really exits.
+            if code.is_none() && minimize_to_tray {
+                api.prevent_exit();
             }
-        });
+        }
+    });
 }

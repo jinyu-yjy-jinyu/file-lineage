@@ -6,7 +6,9 @@
 
 设计原文见 [IDEA.md](./IDEA.md)。
 
-**当前版本：V2（采集层硬化）。V2 只动后端，前端界面与 V1 完全一致；界面改版留给 V3。**
+**当前版本：V2.0.1（V2 采集层硬化 + 启动热修）。V2 只动后端，前端界面与 V1 完全一致；界面改版留给 V3。**
+
+> **0.2.1 热修（重要）**：0.2.0 在**装过并运行过 V1** 的机器上会无法启动（双击无反应、无托盘、无提示）。原因见下方「升级与启动诊断」。如果你装过 0.2.0 且启动不了，直接覆盖安装 0.2.1 即可，原有数据会自动迁移，不会丢失。
 
 ---
 
@@ -149,6 +151,43 @@ hash_chunks_per_minute = 9000   # 每分钟最多计算多少个 1 MiB 分块（
 
 ---
 
+## 升级与启动诊断（0.2.1）
+
+### 0.2.0 的启动故障
+
+在**装过并运行过 V1** 的机器上，0.2.0 双击后完全没反应：没有窗口、没有托盘、没有错误提示。
+
+原因链条：
+
+1. V1 的 `files` 表只有 15 列，没有 `volume_serial` / `file_index` 等 V2 列；
+2. 0.2.0 启动时把「建表 + 建索引」放在同一段 `execute_batch` 里，其中
+   `CREATE INDEX idx_files_identity ON files(volume_serial, file_index)` 引用了还不存在的列；
+3. 对 V1 数据库，`CREATE TABLE IF NOT EXISTS` 是空操作，列要等后面的 `migrate()` 才补 —— 顺序反了，SQLite 报 `no such column: volume_serial`；
+4. 调用方是 `.expect("failed to open the lineage database")`，而发布版是
+   `windows_subsystem = "windows"` 的 GUI 程序，没有控制台，panic 直接静默退出。
+
+### 0.2.1 的修法
+
+- schema 拆成两段：**先只建表 → `migrate()` 补列 → 再建索引**。第 1 阶段绝不引用任何可能被迁移补充的列，第 3 阶段执行时列一定存在。
+- 启动不再用 `expect`：数据库打开失败、Tauri 应用/托盘构建失败，都会写
+  `%LOCALAPPDATA%\FileLineage\startup.log` 并弹出**可见的错误框**（含错误详情和日志路径）。
+- 安装 `panic hook`，任何启动期 panic 也会先落到 `startup.log`（超过 512 KiB 自动轮换）。
+- 关键节点都有日志：`config loaded` / `database opened / migration ok` / `setup ok / tray built / collector started` / `tauri app built / entering event loop` / `second instance detected`。
+
+所以再遇到启动问题，第一件事是看 `startup.log`——它会直接告诉你卡在哪一步、报什么错。
+
+### 升级行为
+
+覆盖安装不会删除数据。首次启动 0.2.1 会对 V1 库执行：
+
+- 幂等补列（`hash_reason` / `volume_serial` / `file_index` / `chunk_count` / `opened_ts`），已存在的列会跳过；
+- 把 V1 的整文件哈希全部置空并重新入队 —— V2 的内容根是「对分块摘要再哈希」，与 V1 的整文件 BLAKE3 数值不同，必须重算才能比较；
+- 补建 `chunks` 表和全部索引。
+
+对全新安装则是一次性建好全部表与索引。
+
+---
+
 ## 构建安装包（只走 GitHub Actions）
 
 **本机不构建安装包。** 本机只负责写代码、提交、推送；编译与 NSIS 打包全部在 `windows-latest` runner 上完成。
@@ -157,7 +196,7 @@ hash_chunks_per_minute = 9000   # 每分钟最多计算多少个 1 MiB 分块（
    - 建议勾选 `create_release`：安装包会同时发布到 **Releases**，得到永久下载链接（Release 资源不占用 Actions Artifact 存储配额）。
 2. 等约 10–25 分钟（首次要编译 Rust 依赖）。
 3. 下载位置二选一：
-   - **Releases** → `FileLineage_0.2.0_x64-setup.exe`（推荐，长期保留）；
+   - **Releases** → `FileLineage_0.2.1_x64-setup.exe`（推荐，长期保留）；
    - 该次 run 的 **Artifacts** → `FileLineage-Windows-x64`（保留 30 天，若账户 Artifact 配额耗尽该步会被跳过，但不影响构建结果）。
 4. 推送 `v*` tag 会自动触发构建并自动发布 Release。
 

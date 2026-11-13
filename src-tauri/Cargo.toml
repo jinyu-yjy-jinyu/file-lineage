@@ -1,0 +1,32 @@
+[package]
+name = "file-lineage"
+version = "0.1.0"
+description = "文件因果溯源台 — file causality & lineage for Windows"
+authors = ["FileLineage"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "file_lineage_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+notify = "6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"
+walkdir = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[profile.dev]
+incremental = true

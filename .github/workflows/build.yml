@@ -1,0 +1,101 @@
+name: Build Windows Installer
+
+# The installer is built ONLY on GitHub Actions, never on a developer machine.
+# V1 flow: commit -> push -> click "Run workflow" (one build per milestone).
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "同时把安装包发布到 GitHub Release"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build NSIS installer (x64)
+    runs-on: windows-latest
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install stable Rust (MSVC target)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Makes cl.exe and the Windows SDK import libraries (rstrtmgr.lib,
+      # kernel32.lib, ...) available to rustc / cc / link.exe.
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Typecheck + build frontend
+        run: npm run build
+
+      # Fail fast with readable Rust diagnostics before the expensive bundling.
+      - name: Typecheck Rust crate
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Tauri installer
+        run: npm run tauri build
+        env:
+          RUST_BACKTRACE: "1"
+
+      - name: Collect installer files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $bundle = Join-Path $PWD "src-tauri\target\release\bundle"
+          if (-not (Test-Path $bundle)) { throw "No bundle directory was produced" }
+          Get-ChildItem -Path $bundle -Recurse -File -Include *.exe,*.msi | ForEach-Object {
+            Copy-Item $_.FullName -Destination artifacts
+            Write-Host "installer: $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)"
+          }
+          $count = (Get-ChildItem artifacts -File | Measure-Object).Count
+          if ($count -eq 0) { throw "No installer was produced" }
+          Get-ChildItem artifacts -File | Format-Table Name, Length
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileLineage-Windows-x64
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v0.1.0-{0}', github.run_number) }}
+          name: FileLineage V1
+          body: |
+            Windows x64 安装包（NSIS）。
+
+            V1 范围：监控 Downloads / Desktop / Documents 三个目录，
+            回答「从哪来 / 谁改过 / 删了会不会丢」三个问题。
+            数据全部保存在本机 SQLite，不上传任何内容。
+          files: artifacts/*

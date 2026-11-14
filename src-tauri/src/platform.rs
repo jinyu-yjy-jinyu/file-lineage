@@ -35,8 +35,9 @@ fn push_dir(out: &mut Vec<PathBuf>, candidate: Option<PathBuf>) {
     }
 }
 
-/// User folders we watch. Uses the platform's real shell folders; the
-/// OneDrive-redirected variants only exist on Windows.
+/// User folders in the *fingerprint / real-time* scope ("hot dirs"). Uses the
+/// platform's real shell folders; the OneDrive-redirected variants only exist
+/// on Windows. Everything outside these dirs is index-only (`hash_state=skip`).
 pub fn watch_dirs() -> Vec<PathBuf> {
     let mut out = Vec::new();
     push_dir(&mut out, dirs::download_dir());
@@ -53,6 +54,128 @@ pub fn watch_dirs() -> Vec<PathBuf> {
         }
     }
     out
+}
+
+// ------------------------------------------------------- full-disk index
+
+/// Enumerate fixed local drives. `GetLogicalDriveStringsW` alone would also
+/// return CD-ROM, mapped network and USB drives; those either disappear (watch
+/// handle churn) or hold someone else's millions of files, so they are opt-in.
+#[cfg(windows)]
+fn windows_drive_roots(include_removable: bool, include_network: bool) -> Vec<PathBuf> {
+    use crate::win32 as w;
+    let mut buffer = [0u16; 512];
+    let length = unsafe { w::GetLogicalDriveStringsW(buffer.len() as u32, buffer.as_mut_ptr()) };
+    if length == 0 {
+        return Vec::new();
+    }
+    let end = (length as usize).min(buffer.len());
+    let mut out = Vec::new();
+    for chunk in buffer[..end].split(|c| *c == 0) {
+        if chunk.len() < 2 {
+            continue;
+        }
+        // "C:\" — the trailing backslash is required by GetDriveTypeW.
+        let root = String::from_utf16_lossy(chunk);
+        let wide = crate::util::to_wide(std::ffi::OsStr::new(&root));
+        let kind = unsafe { w::GetDriveTypeW(wide.as_ptr()) };
+        let include = kind == w::DRIVE_FIXED
+            || (include_removable && kind == w::DRIVE_REMOVABLE)
+            || (include_network && kind == w::DRIVE_REMOTE);
+        if !include {
+            continue;
+        }
+        push_dir(&mut out, Some(PathBuf::from(&root)));
+    }
+    out
+}
+
+/// Roots the background indexer walks. On Windows these are the fixed drives;
+/// on Unix it is `/` (prefix exclusions are applied by the walker). If drive
+/// enumeration fails we fall back to the hot dirs rather than indexing nothing.
+pub fn index_roots(include_removable: bool, include_network: bool) -> Vec<PathBuf> {
+    let _ = (include_removable, include_network);
+    #[cfg(windows)]
+    let roots = windows_drive_roots(include_removable, include_network);
+    #[cfg(not(windows))]
+    let roots: Vec<PathBuf> = {
+        let root = PathBuf::from("/");
+        if root.is_dir() {
+            vec![root]
+        } else {
+            Vec::new()
+        }
+    };
+    if roots.is_empty() {
+        watch_dirs()
+    } else {
+        roots
+    }
+}
+
+/// Root-level prefixes that must never be walked or watched on Unix: virtual
+/// filesystems, other mounts and OS-private trees. Directory *names* are
+/// excluded separately by `util::should_skip_dir`.
+pub fn index_exclusions() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    const PREFIXES: &[&str] = &[
+        "/System",
+        "/private",
+        "/Volumes",
+        "/dev",
+        "/net",
+        "/home",
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    const PREFIXES: &[&str] = &[
+        "/proc",
+        "/sys",
+        "/dev",
+        "/run",
+        "/var/run",
+        "/tmp",
+        "/mnt",
+        "/media",
+        "/snap",
+        "/boot/efi",
+    ];
+    #[cfg(not(unix))]
+    const PREFIXES: &[&str] = &[];
+    PREFIXES.iter().map(|prefix| PathBuf::from(*prefix)).collect()
+}
+
+/// What the real-time watcher can honestly cover.
+///
+/// Windows (ReadDirectoryChangesW) and macOS (FSEvents) can watch a whole
+/// volume recursively. Linux inotify has a per-user watch limit, so watching
+/// `/` silently drops events; there we only watch the hot dirs and let the
+/// nightly resweep converge everything else.
+pub fn watch_roots(hot_dirs: &[PathBuf], index_roots: &[PathBuf]) -> (Vec<PathBuf>, String) {
+    let _ = index_roots;
+    #[cfg(windows)]
+    let (roots, scope) = (
+        if index_roots.is_empty() {
+            hot_dirs.to_vec()
+        } else {
+            index_roots.to_vec()
+        },
+        "固定磁盘根目录（递归 watch）".to_string(),
+    );
+    #[cfg(target_os = "macos")]
+    let (roots, scope) = (
+        if index_roots.is_empty() {
+            hot_dirs.to_vec()
+        } else {
+            index_roots.to_vec()
+        },
+        "整个磁盘（FSEvents 递归）".to_string(),
+    );
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let (roots, scope) = (
+        hot_dirs.to_vec(),
+        "仅指纹范围目录（本平台全盘 watch 不可靠，其余依赖每夜重扫）".to_string(),
+    );
+    (roots, scope)
 }
 
 // --------------------------------------------------------------- elevation

@@ -207,6 +207,15 @@ input {
   color: var(--ink-muted);
   border-color: var(--hairline-strong);
 }
+.truncated-pill {
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: var(--surface-2);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  white-space: nowrap;
+}
 
 .topbar-actions {
   display: flex;
@@ -273,6 +282,10 @@ input {
   min-height: 0;
   display: grid;
   grid-template-columns: 250px minmax(360px, 1fr) 460px;
+  /* 隐式行轨道是 auto，会随内容撑高 grid item，使 .sidebar/.table-wrap/.detail 的
+     overflow-y:auto 永不触发（溢出被 body{overflow:hidden} 裁掉）。minmax(0,1fr)
+     的行轨道最小值是 0，才能保证三个容器各自内部滚动。 */
+  grid-template-rows: minmax(0, 1fr);
 }
 .sidebar,
 .detail {
@@ -326,6 +339,11 @@ input {
   background: var(--surface-2);
   font-size: 12px;
   color: var(--ink-muted);
+}
+.dir-list.compact li {
+  padding: 4px 8px;
+  margin-bottom: 4px;
+  font-size: 11px;
 }
 .dir-icon {
   color: var(--ink-subtle);

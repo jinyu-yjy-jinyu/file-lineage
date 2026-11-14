@@ -174,7 +174,7 @@ pub struct Status {
     pub event_count: i64,
     pub hashed_count: i64,
     pub pending_hash: i64,
-    /// idle | scanning | hashing | ready
+    /// idle | scanning | indexing | hashing | ready
     pub scan_state: String,
     pub scan_total: i64,
     pub scan_done: i64,
@@ -211,4 +211,19 @@ pub struct Status {
     pub recent_entries: i64,
     pub total_db_size: i64,
     pub schema_version: i64,
+
+    // ---- V4 (0.4.0): full-disk index + fingerprint scope ------------------
+    /// idle | indexing | done — a full-disk index pass, separate from the
+    /// hash queue so "ready" never hides an interrupted first scan.
+    pub index_state: String,
+    /// Drive roots / Unix root actually walked by the indexer.
+    pub index_roots: Vec<String>,
+    /// Directories with fingerprints + real-time events ("hot dirs").
+    pub hot_dirs: Vec<String>,
+    /// True when the FTS5 trigram index was built and queries use MATCH.
+    pub fts_enabled: bool,
+    /// The last index pass hit `max_scan_files`; kept in the ready state.
+    pub scan_truncated: bool,
+    /// Honest description of what real-time watching actually covers.
+    pub watch_scope: String,
 }

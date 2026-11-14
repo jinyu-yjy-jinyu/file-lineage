@@ -28,6 +28,14 @@ pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// `GetDriveTypeW` return values. Only fixed disks are indexed by default:
+/// removable/network drives vanish (watch churn) or hold millions of files.
+pub const DRIVE_REMOVABLE: u32 = 2;
+pub const DRIVE_FIXED: u32 = 3;
+pub const DRIVE_REMOTE: u32 = 4;
+pub const DRIVE_CDROM: u32 = 5;
+pub const DRIVE_RAMDISK: u32 = 6;
+
 pub const SW_SHOW: i32 = 5;
 pub const SW_RESTORE: i32 = 9;
 
@@ -113,6 +121,10 @@ extern "system" {
     pub fn QueryDosDeviceW(device_name: *const u16, target_path: *mut u16, max: u32) -> u32;
 
     pub fn GetLogicalDriveStringsW(buffer_length: u32, buffer: *mut u16) -> u32;
+
+    /// Needs a root path with a trailing backslash (`C:\`), which is exactly
+    /// what `GetLogicalDriveStringsW` yields.
+    pub fn GetDriveTypeW(root_path_name: *const u16) -> u32;
 
     pub fn CloseHandle(object: Handle) -> Bool;
 

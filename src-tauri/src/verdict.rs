@@ -96,7 +96,7 @@ pub struct SafetyDigest {
     pub hardlink_copies: i64,
     /// Live files whose fingerprint is not finished yet (global coverage).
     pub pending_unhashed: i64,
-    /// Is this file inside a watched directory?
+    /// Is this file inside the fingerprint-scope directories?
     pub watched: bool,
     /// Files sharing some chunks — "related", never a copy.
     pub related: i64,
@@ -290,6 +290,8 @@ pub fn build(input: &VerdictInput) -> Verdict {
         } else {
             drivers.push("内容指纹已完成，但库内仍有未完成指纹的文件".to_string());
         }
+    } else if input.safety.hash_state == "skip" {
+        drivers.push("内容指纹状态：skip（在指纹范围外，不参与计算）".to_string());
     } else {
         drivers.push(format!("内容指纹状态：{}（尚未完成）", input.safety.hash_state));
     }
@@ -312,10 +314,18 @@ pub fn build(input: &VerdictInput) -> Verdict {
         caveats.push("部分「被打开」记录按文件名匹配，属于推断信号而非硬证据".to_string());
     }
     if !input.safety.ready() {
-        caveats.push(format!(
-            "内容指纹尚未完成（{}），删除后果暂时无法判断",
-            input.safety.hash_state
-        ));
+        if input.safety.hash_state == "skip" {
+            // An index-only file never had a fingerprint at all; saying the
+            // queue is "still working" would be a lie that never resolves.
+            caveats.push(
+                "该文件仅建立索引（在指纹范围外），未计算内容指纹，无法判断删除后果".to_string(),
+            );
+        } else {
+            caveats.push(format!(
+                "内容指纹尚未完成（{}），删除后果暂时无法判断",
+                input.safety.hash_state
+            ));
+        }
     }
     if coverage_insufficient {
         caveats.push(format!(
@@ -329,7 +339,7 @@ pub fn build(input: &VerdictInput) -> Verdict {
         && input.safety.coverage_ok()
     {
         caveats.push(
-            "「唯一副本」只覆盖受监控目录；其它磁盘位置或云端的副本不在结论范围内".to_string(),
+            "「唯一副本」只覆盖指纹范围目录；其它磁盘位置或云端的副本不在结论范围内".to_string(),
         );
     }
     if input.source_kind == "download" && origin_conf == "high" {
@@ -387,7 +397,7 @@ pub fn build(input: &VerdictInput) -> Verdict {
         (
             "唯一副本，删除会丢内容".to_string(),
             "keep".to_string(),
-            "内容指纹在受监控目录内只出现一次，且库内没有未完成指纹的文件，删除后本机不再有相同内容。"
+            "内容指纹在指纹范围目录内只出现一次，且库内没有未完成指纹的文件，删除后本机不再有相同内容。"
                 .to_string(),
         )
     } else {
@@ -637,5 +647,43 @@ mod tests {
         assert_eq!(verdict.action, "delete_safe");
         assert!(verdict.headline.contains("硬链接"));
         assert!(verdict.confidence != "high" || verdict.score < 90);
+    }
+
+    /// 0.4.0: an index-only (skip) file must say honestly that no fingerprint
+    /// was ever computed, instead of promising a queue that will never finish.
+    #[test]
+    fn skip_file_is_explicitly_out_of_fingerprint_scope() {
+        let verdict = build(&input(
+            high_origin(),
+            etw_processes(),
+            SafetyDigest {
+                hash_state: "skip".to_string(),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(verdict.action, "verify_first");
+        assert!(verdict.score <= 55);
+        assert!(verdict
+            .caveats
+            .iter()
+            .any(|c| c.contains("指纹范围外") && c.contains("无法判断删除后果")));
+        assert!(verdict
+            .drivers
+            .iter()
+            .any(|d| d.contains("不参与计算")));
+    }
+
+    #[test]
+    fn unique_copy_caveat_names_the_fingerprint_scope() {
+        let verdict = build(&input(
+            high_origin(),
+            etw_processes(),
+            complete_unique_safety(),
+        ));
+        assert!(verdict
+            .caveats
+            .iter()
+            .any(|c| c.contains("指纹范围目录")));
+        assert!(!verdict.caveats.iter().any(|c| c.contains("受监控目录")));
     }
 }

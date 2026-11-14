@@ -6,8 +6,10 @@
 
 设计原文见 [IDEA.md](./IDEA.md)。
 
-**当前版本：0.3.0。** 三条主线：跨平台可编译可发行、Q1+Q2+Q3 综合结论与可信度、dark-saas 界面重构。
+**当前版本：0.4.0。** 四条主线：三栏滚动修复、全盘后台索引 + 冷热指纹范围、FTS5 搜索（带回退）、UI 契约与文案如实反映索引范围。
 
+> **0.4.0**：后台索引所有固定磁盘（Windows `GetDriveTypeW` 只收 `DRIVE_FIXED`；macOS/Linux 从 `/` 出发并排除系统前缀）；仅「下载 / 桌面 / 文档 / OneDrive」等热区计算 BLAKE3 指纹、产生事件与实时归因，冷区文件 `hash_state='skip'` 只登记索引。`files.last_event_ts` 物化 + 分批回填取代每行相关子查询；FTS5 trigram 带运行时探测与 LIKE 回退；schema v4；Linux 实时 watch 诚实降级为热区 + 每夜重扫；修复 `.layout` 隐式 `auto` 行导致三栏无法滚动。
+>
 > **0.3.0**：三平台发行（NSIS / .app + .dmg / .deb + AppImage）；详情页在三张问答卡之后新增**最终结论卡**，可信度由证据强度推导（不是写死）；界面改为 dark-saas（Linear 式）视觉；发布流水线改为「三平台矩阵 + 单一 release job」，并新增版本一致性守卫。
 >
 > **0.2.2**：第三方下载器任务记录（Ghost Downloader）来源适配器，可追溯安装前已下载的文件。
@@ -16,17 +18,19 @@
 
 ## 版本边界
 
-| | 0.2.2 | 0.3.0（本次） |
-| --- | --- | --- |
-| 平台 | Windows x64 | **Windows x64 / macOS universal / Linux x64** |
-| 界面 | 三栏（冷色） | 三栏 + 综合结论卡，dark-saas token 体系 |
-| Q1 可信度 | 按 `source_kind` 猜（下载目录=高） | **按证据通道强度分级**：`zone.ads` / `downloader.task` = 3，`rm.handle` / IM 布局 = 2，路径特征 = 1 |
-| Q2 进程 | ETW + Restart Manager | 保留；**非 Windows 如实降级**并写进结论的保留意见 |
-| Q3 删除后果 | 「唯一副本」只看是否命中哈希 | **必须满足覆盖率条件**（无未完成指纹 + 文件在监控目录内），否则降级 |
-| 重命名 | 依赖 `RenameMode::Both`（Windows 后端从不发） | **按 FileID / inode 跨路径重连**，三平台一致 |
-| 身份 | Windows NTFS FileID | Windows FileID + Unix `(st_dev, st_ino)` |
-| 结论 | 三张卡各说各的 | **Q1+Q2+Q3 → headline / confidence / score / drivers / caveats / action** |
-| 发布 | 单平台单 job 直接发 Release | 矩阵构建 → 单一 release job；版本守卫 + 产物存在性断言 |
+| | 0.2.2 | 0.3.0 | 0.4.0（本次） |
+| --- | --- | --- | --- |
+| 平台 | Windows x64 | **Windows x64 / macOS universal / Linux x64** | 三平台不变 |
+| 索引范围 | 三个用户目录 | 三个用户目录 | **所有固定磁盘**；冷区只建索引（`skip`），默认不含可移动 / 网络盘 |
+| 界面 | 三栏（冷色） | 三栏 + 综合结论卡，dark-saas token 体系 | 三栏滚动修复；索引范围卡、全盘搜索占位、截断徽标 |
+| Q1 可信度 | 按 `source_kind` 猜（下载目录=高） | **按证据通道强度分级**：`zone.ads` / `downloader.task` = 3，`rm.handle` / IM 布局 = 2，路径特征 = 1 | 不变；来源记录回填限定指纹范围目录，避免全盘同名误归因 |
+| Q2 进程 | ETW + Restart Manager | 保留；**非 Windows 如实降级**并写进结论的保留意见 | 冷区事件不 probe、不写事件；Windows 固定盘根 / macOS `/` 递归 watch |
+| Q3 删除后果 | 「唯一副本」只看是否命中哈希 | **必须满足覆盖率条件**（无未完成指纹 + 文件在指纹范围目录内），否则降级 | `skip` 文件明确「未计算内容指纹，无法判断删除后果」；「唯一副本」只覆盖指纹范围目录 |
+| 重命名 | 依赖 `RenameMode::Both`（Windows 后端从不发） | **按 FileID / inode 跨路径重连**，三平台一致 | 不变；FTS 触发器同步 `name` / `path` |
+| 身份 | Windows NTFS FileID | Windows FileID + Unix `(st_dev, st_ino)` | 不变 |
+| 结论 | 三张卡各说各的 | **Q1+Q2+Q3 → headline / confidence / score / drivers / caveats / action** | 不变；保留意见措辞改为「指纹范围目录」 |
+| 查询 | LIKE + 每行相关子查询取最新事件 | LIKE + 每行相关子查询取最新事件 | 物化 `last_event_ts` + 索引；FTS5 trigram（运行时探测，失败回退 LIKE） |
+| 发布 | 单平台单 job 直接发 Release | 矩阵构建 → 单一 release job；版本守卫 + 产物存在性断言 | 不变；`check_only` 先行 → `v0.4.0` |
 
 数据全部留在本机：SQLite（Windows `%LOCALAPPDATA%\FileLineage\`，macOS `~/Library/Application Support/FileLineage/`，Linux `$XDG_DATA_HOME/FileLineage/`），无任何网络上传，前端不引用任何外部 CDN。
 
@@ -55,6 +59,9 @@ incremental_hash = true         # 文件只增长时复用已有分块指纹
 archive_after_days = 90         # 事件转只读归档的天数
 settle_seconds = 20             # 最后一次写入后静默多久才计算指纹
 hash_chunks_per_minute = 9000   # 每分钟最多计算多少个 1 MiB 分块（背压）
+max_scan_files = 1000000        # 单次全盘索引最多登记多少个文件（达到上限在界面显示徽标）
+index_removable = false         # 是否索引可移动盘（仅 Windows）
+index_network = false           # 是否索引映射网络盘（仅 Windows）
 ```
 
 托盘右键菜单：显示主窗口 / 重新扫描 / 开机自启（勾选）/ 退出。勾选状态以**系统登录项真值**为准；切换失败或 `config.ini` 写不进去时会回滚勾选并把原因写进 `Status.lastError`。
@@ -70,7 +77,7 @@ hash_chunks_per_minute = 9000   # 每分钟最多计算多少个 1 MiB 分块（
 └─────────────────────────────── invoke ───────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Tauri 2 / Rust                                  托盘 + 单实例 + 自启 │
-│  platform.rs  数据目录 / 监控目录 / 登录项 / 提权 / 单实例 / reveal     │
+│  platform.rs  数据目录 / 索引范围 / 登录项 / 提权 / 单实例 / reveal     │
 │  ┌──────────────┐   ┌─────────────────────┐   ┌───────────────────┐  │
 │  │  etw.rs      │   │  attrib.rs          │   │  sources.rs       │  │
 │  │ Kernel-File  │   │ Restart Manager     │   │ Zone.Identifier   │  │
@@ -78,13 +85,13 @@ hash_chunks_per_minute = 9000   # 每分钟最多计算多少个 1 MiB 分块（
 │  └──────┬───────┘   └──────────┬──────────┘   └─────────┬─────────┘  │
 │         └──────────┬───────────┘                        │            │
 │              ┌─────▼──────────────────────────────────▼─────┐        │
-│              │ collector.rs  notify → 400ms 去抖 → 归因     │        │
-│              │ recent.rs / identity.rs / rename reconnect   │        │
+│              │ collector.rs  notify → 去抖 → 归因 / 冷区降级 │        │
+│              │ 全盘 indexer：热区 settling / 冷区 skip       │        │
 │              └─────┬──────────────────────────┬─────────────┘        │
 │        ┌───────────▼──────────┐   ┌───────────▼──────────────────┐   │
 │        │ fingerprint.rs       │   │ db.rs  SQLite WAL            │   │
 │        │ 1 MiB 分块 BLAKE3    │──▶│ files / events / chunks      │   │
-│        │ 增量复用 + 预算限速  │   │ + archive-YYYYMM.db          │   │
+│        │ 增量复用 + 预算限速  │   │ + files_fts(FTS5) / archive  │   │
 │        └──────────────────────┘   └───────────┬──────────────────┘   │
 │                                  ┌────────────▼──────────────┐       │
 │                                  │ verdict.rs 纯函数打分      │       │
@@ -125,8 +132,24 @@ hash_chunks_per_minute = 9000   # 每分钟最多计算多少个 1 MiB 分块（
 1. 指纹未完成（`pending/settling/error/too_large`）→ 低置信 + `verify_first`；
 2. 存在内容相同的独立副本 → 高置信；
 3. 只有硬链接 → 删除不释放空间但也不丢内容；
-4. 没有副本时，必须同时满足「库内无未完成指纹」且「文件在监控目录内」才给高置信，否则带保留意见降级；
+4. 没有副本时，必须同时满足「库内无未完成指纹」且「文件在指纹范围目录内」才给高置信，否则带保留意见降级；
 5. 部分相同的关联文件**永不**算作副本。
+
+### 索引范围与冷热分离（0.4.0）
+
+后台索引的根由 `platform::index_roots()` 决定：Windows 用 `GetLogicalDriveStringsW` + `GetDriveTypeW` 只收 `DRIVE_FIXED`；macOS / Linux 从 `/` 出发，按前缀排除 `/System`、`/proc`、`/dev` 等系统树，并按目录名排除 `.fseventsd`、`lost+found`、`node_modules` 等。`WalkDir` 深度 32、不跟随链接，每 2000 文件一批事务，`max_scan_files` 默认 1,000,000，达到上限会在界面显示「已达索引上限」且完成态仍保留。
+
+| | 热区（指纹范围目录） | 冷区（其余索引范围） |
+| --- | --- | --- |
+| 目录 | 下载 / 桌面 / 文档 / OneDrive 重定向目录 | 固定磁盘上的其它路径 |
+| `hash_state` | `settling` → `pending` → `done` | `skip`，永不进入哈希队列 |
+| 事件 | baseline `observed` + 实时变更 / 打开 / 下载记录 | **无事件**，只更新路径、大小、mtime 与 liveness |
+| 实时监控 | probe → 事件 → settle | 只 upsert + `mark_gone`，不做 Restart Manager 探测 |
+| Q3 | 可给出副本 / 唯一副本结论 | 「未计算内容指纹，无法判断删除后果」 |
+
+旧库升级时按 `meta.v4_rescope_done` 一次性把热区外的 `settling/pending` 改成 `skip`；`recent` / 下载器任务记录的名字匹配也改为在 SQL 里限定热区前缀，避免全盘同名文件被误写 `opened` / `downloaded` 事件。
+
+查询侧：`files.last_event_ts` 物化列 + `idx_files_last_event` 取代 `ORDER BY` 里的每行相关子查询；FTS5 trigram 外部内容表 `files_fts` 用三个触发器同步 `name` / `path`，≥3 字符的查询走 `MATCH`（短语加引号转义），其余与探测失败时回退 `LIKE`。schema v4 的回填按 5000 行一事务、`meta.v4_backfill_done` 幂等续跑，失败只写 `Status.last_error` 与 `startup.log`，不阻塞启动。
 
 ### 最终结论与可信度
 
@@ -166,7 +189,9 @@ confidence = score>=78 高；50..77 中；<50 低
 
 ## macOS / Linux 使用注意
 
-- **macOS 首次运行需授权**：系统设置 → 隐私与安全性 → 文件与文件夹（或「完全磁盘访问权限」），允许访问「桌面 / 下载 / 文档」。未授权时 FSEvents 静默无事件，界面会显示「0 个目录可监控」。
+- **macOS 首次运行需授权**：系统设置 → 隐私与安全性 → 文件与文件夹（或「完全磁盘访问权限」），允许访问「桌面 / 下载 / 文档」。未授权时 FSEvents 静默无事件，界面会显示「0 个目录可监控」。索引 `/` 同样受这些权限约束，未覆盖到的路径由每夜重扫补齐。
+- **Linux 实时监控仅限指纹范围目录**：inotify 有每用户 watch 上限，watch `/` 会静默丢事件；`Status.watchScope` 会如实写明，其余路径靠每夜（24 小时周期）增量重扫 + `exists()` 批量标 gone 收敛。
+- **Windows 盘符拔插**：watch 错误只写 `Status.lastError`，不会批量把整个盘标成 gone（防 U 盘震荡），收敛同样交给每夜重扫。
 - macOS 未签名发行版首次打开需在「隐私与安全性」里放行（或右键 → 打开）。发布说明会写明。
 - Linux 的 AppImage 需要 `chmod +x`；部分发行版还需 `libfuse2`。托盘依赖 `libayatana-appindicator3`。
 - **ETW 仅 Windows 且需要管理员权限**。默认常驻进程是普通权限，因此大多数时候实际生效的是 Restart Manager；macOS/Linux 完全没有进程级归因，这是平台事实，不是 bug。
@@ -190,16 +215,16 @@ confidence = score>=78 高；50..77 中；<50 低
 gh workflow run build.yml -f check_only=true
 
 # 2. 全绿后，推 tag 触发正式发布
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.4.0 && git push origin v0.4.0
 ```
 
 发布产物文件名：
 
-- `FileLineage_0.3.0_x64-setup.exe`（NSIS，单用户安装）
-- `FileLineage_0.3.0_universal.dmg` / `FileLineage.app`
-- `FileLineage_0.3.0_amd64.deb` / `FileLineage_0.3.0_amd64.AppImage`
+- `FileLineage_0.4.0_x64-setup.exe`（NSIS，单用户安装）
+- `FileLineage_0.4.0_universal.dmg` / `FileLineage.app`
+- `FileLineage_0.4.0_amd64.deb` / `FileLineage_0.4.0_amd64.AppImage`
 
-Release 名称由版本守卫输出派生：`FileLineage v0.3.0`，release notes 自动生成。
+Release 名称由版本守卫输出派生：`FileLineage v0.4.0`，release notes 自动生成。
 
 ---
 
@@ -246,8 +271,8 @@ src/                          React + TypeScript 前端
   theme.ts                    画布与图例共用的配色 token（唯一真源）
   api.ts                      Tauri invoke + 浏览器 demo 数据
 src-tauri/                    Tauri 2 + Rust 采集 daemon
-  src/platform.rs             跨平台：数据目录/监控目录/登录项/提权/单实例/reveal
-  src/collector.rs            监控、去抖、扫描、settle、维护循环
+  src/platform.rs             跨平台：数据目录/索引范围/登录项/提权/单实例/reveal
+  src/collector.rs            全盘索引、监控去抖、冷区降级、settle、每夜重扫
   src/etw.rs                  ETW 通道（仅 Windows）+ 非 Windows 空实现
   src/attrib.rs               进程归因（仅 Windows 有真实实现）
   src/identity.rs             FileID / inode 文件身份
@@ -257,7 +282,7 @@ src-tauri/                    Tauri 2 + Rust 采集 daemon
   src/downloaders.rs          第三方下载器任务日志解析器
   src/im_layout.rs            IM 接收目录布局解析
   src/recent.rs               Shell「最近使用」打开记录（仅 Windows）
-  src/db.rs                   schema/迁移、查询、Q1-Q3 解释、归档
+  src/db.rs                   schema v4/迁移、FTS5 双路查询、Q1-Q3 解释、归档
   src/verdict.rs              Q1+Q2+Q3 综合结论打分（纯函数 + 单测）
   src/config.rs               config.ini
   src/runtime.rs              platform 的兼容门面（保持调用点不变）
@@ -267,13 +292,18 @@ src-tauri/                    Tauri 2 + Rust 采集 daemon
 
 ---
 
-## 已知限制（0.3.0）
+## 已知限制（0.4.0）
 
+- **默认不索引可移动盘 / 网络盘**：拔插会让 watch 句柄反复失效，NAS 常驻百万级文件；Windows 可在 `config.ini` 打开 `index_removable` / `index_network`（其余平台无对应盘符概念）。
+- **冷区文件不参与重复判断**：`skip` 文件只建立索引，没有 BLAKE3 指纹，Q3 会明确写「未计算内容指纹，无法判断删除后果」，因此「唯一副本」结论只覆盖指纹范围目录，不得声称全盘唯一。
+- **Linux 实时监控仅限指纹范围目录**：inotify 上限无法全盘 watch，其余路径依赖每夜（24 小时周期）增量重扫；`Status.watchScope` 如实说明。
+- **NTFS MFT / USN 直读本轮未做**：需要管理员权限 + 大量 unsafe FFI，且 CI 无法验证运行期行为。触发条件是百万级首扫耗时或需要秒级新建文件收敛；届时再评估替换 `WalkDir`。
+- **OneDrive 占位文件**：热区文件被哈希时可能触发云端水合（0.3.0 已有风险，全盘索引后范围未扩大到冷区，但未消除）。
+- **FTS5 是运行时能力**：若发行环境链接的 SQLite 没有 FTS5 / trigram，搜索自动回退 `LIKE`；`Status.ftsEnabled` 与侧栏文案会说明当前路径。少于 3 个码点的查询（含两字中文词）也走 `LIKE`。
 - **ETW 需要管理员权限**，默认常驻进程拿不到，因此大多数时候实际生效的是 Restart Manager；macOS/Linux 没有等价通道，Q2 上限为 medium。
-- 「唯一副本」只覆盖**已监控的三个目录**；其它磁盘位置、云端副本、未完成指纹的文件都可能改变结论（未完成时会降级并提示）。
 - 部分相同判定基于固定 1 MiB 分块边界；中间插入内容会退化（内容定义分块留待后续）。
-- `Recent` 的打开记录按文件名匹配，同名文件可能误判，因此只作为推断信号，界面有徽章。
+- `Recent` 的打开记录按文件名匹配，同名文件可能误判；现在 SQL 已限定指纹范围目录前缀，且只作为推断信号，界面有徽章。
 - 下载器适配器目前只接了 Ghost Downloader；Motrix / IDM / FDM / aria2 留待按需添加。
-- 归档库按 `file_id` 查询；如果将来加入文件记录清理，需要同时处理归档库的对应关系。
+- 归档库按 `file_id` 查询；如果将来加入文件记录清理，需要同时处理归档库的对应关系（归档库不含 FTS 表）。
 - macOS 未签名发行版需要手动放行；菜单栏托盘图标暂用彩色图标，深色菜单栏下的观感可能与系统模板图有差异。
 - 本机（无 MSVC 链接器）无法验证 Rust 编译与三平台打包，这些必须由 CI 验证；唯一本地门禁是 `npm run build`。

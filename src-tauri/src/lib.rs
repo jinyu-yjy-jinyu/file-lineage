@@ -81,6 +81,7 @@ fn get_status(state: tauri::State<'_, AppState>) -> Status {
     // H6: the OS entry is the truth, not the config file. Reporting the config
     // value made the UI announce "已开机自启" while the registry had no entry.
     snapshot.autostart = runtime::autostart_enabled();
+    snapshot.fts_enabled = state.store.fts_enabled();
     if let Some(error) = state.store.last_error() {
         snapshot.last_error = Some(error);
     }
@@ -291,8 +292,12 @@ pub fn run() {
             return;
         }
     };
+    // `dirs` is the fingerprint / real-time scope; `index_roots` is everything
+    // the background indexer walks. They are different sets on purpose.
     let dirs = platform::watch_dirs();
+    let index_roots = platform::index_roots(config.index_removable, config.index_network);
     store.set_watch_dirs(dirs.clone());
+    let (_, watch_scope) = platform::watch_roots(&dirs, &index_roots);
     let minimized = std::env::args().any(|arg| arg == runtime::MINIMIZED_FLAG);
 
     let status = Arc::new(Mutex::new(Status {
@@ -300,6 +305,18 @@ pub fn run() {
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect(),
+        hot_dirs: dirs
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
+        index_roots: index_roots
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
+        watch_scope,
+        fts_enabled: store.fts_enabled(),
+        index_state: "idle".to_string(),
+        scan_truncated: false,
         db_path: db_path.to_string_lossy().to_string(),
         config_path: config_path.to_string_lossy().to_string(),
         started_at: util::now_ms(),
@@ -336,6 +353,7 @@ pub fn run() {
         Arc::clone(&store),
         Arc::clone(&status),
         dirs,
+        index_roots,
         config.clone(),
     );
     let starter = Arc::clone(&collector);

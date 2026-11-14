@@ -151,6 +151,20 @@ export interface Status {
   recentEntries: number;
   totalDbSize: number;
   schemaVersion: number;
+
+  // ---- 0.4.0: full-disk index + fingerprint scope --------------------------
+  /** idle | indexing | done — independent of the hash queue. */
+  indexState: string;
+  /** Drive roots / Unix root actually walked by the indexer. */
+  indexRoots: string[];
+  /** Directories with fingerprints + real-time events ("hot dirs"). */
+  hotDirs: string[];
+  /** True when FTS5 trigram is available and queries use MATCH. */
+  ftsEnabled: boolean;
+  /** The last index pass reached `max_scan_files`; kept in the ready state. */
+  scanTruncated: boolean;
+  /** Honest description of what real-time watching actually covers. */
+  watchScope: string;
 }
 
 export const emptyStatus: Status = {
@@ -189,4 +203,10 @@ export const emptyStatus: Status = {
   recentEntries: 0,
   totalDbSize: 0,
   schemaVersion: 0,
+  indexState: "idle",
+  indexRoots: [],
+  hotDirs: [],
+  ftsEnabled: false,
+  scanTruncated: false,
+  watchScope: "",
 };

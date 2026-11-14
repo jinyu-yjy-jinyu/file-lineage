@@ -23,6 +23,13 @@ pub struct Config {
     pub settle_seconds: i64,
     /// Upper bound on 1 MiB chunks hashed per minute (disk/CPU back-pressure).
     pub hash_chunks_per_minute: i64,
+    /// Hard cap on files registered in one full-disk index pass. Hitting it
+    /// sets `Status.scan_truncated` instead of silently claiming "ready".
+    pub max_scan_files: i64,
+    /// Include removable drives in the Windows index (watch churn by default).
+    pub index_removable: bool,
+    /// Include mapped network drives in the Windows index (NAS scale by default).
+    pub index_network: bool,
 }
 
 impl Default for Config {
@@ -35,6 +42,9 @@ impl Default for Config {
             archive_after_days: 90,
             settle_seconds: 20,
             hash_chunks_per_minute: 9_000,
+            max_scan_files: 1_000_000,
+            index_removable: false,
+            index_network: false,
         }
     }
 }
@@ -63,6 +73,15 @@ settle_seconds = 20
 
 # 每分钟最多计算多少个 1 MiB 分块（背压上限）
 hash_chunks_per_minute = 9000
+
+# 单次全盘索引最多登记多少个文件；达到上限会在界面显示「已达索引上限」，
+# 调大后重新扫描即可继续（0.4.0）
+max_scan_files = 1000000
+
+# 是否把可移动盘 / 映射网络盘纳入索引（默认关闭：拔插会让 watch 反复失效，
+# NAS 则可能有百万级文件；仅 Windows 生效）
+index_removable = false
+index_network = false
 "#;
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -156,6 +175,21 @@ impl Config {
                     "hash_chunks_per_minute" => {
                         if let Ok(v) = value.parse::<i64>() {
                             config.hash_chunks_per_minute = v.clamp(30, 1_000_000);
+                        }
+                    }
+                    "max_scan_files" => {
+                        if let Ok(v) = value.parse::<i64>() {
+                            config.max_scan_files = v.clamp(10_000, 10_000_000);
+                        }
+                    }
+                    "index_removable" => {
+                        if let Some(v) = parse_bool(value) {
+                            config.index_removable = v;
+                        }
+                    }
+                    "index_network" => {
+                        if let Some(v) = parse_bool(value) {
+                            config.index_network = v;
                         }
                     }
                     _ => {}

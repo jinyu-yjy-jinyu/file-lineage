@@ -52,6 +52,28 @@ const demoFiles: FileRow[] = [
     liveness: "live",
     openedTs: 0,
   },
+  {
+    // 0.4.0: a cold-zone (index-only) file. It must never claim a fingerprint.
+    id: 3,
+    path: "D:\\Archive\\setup-x64.exe",
+    name: "setup-x64.exe",
+    ext: "exe",
+    size: 84_312_064,
+    mtime: now - 1000 * 60 * 60 * 52,
+    sourceKind: "unknown",
+    sourceLabel: "来源未知",
+    sourceDetail: null,
+    sourceEvidence: "none",
+    sourceStrength: 0,
+    changeCount: 0,
+    createdAt: now - 1000 * 60 * 60 * 52,
+    duplicateCount: 0,
+    contentHash: null,
+    hashState: "skip",
+    lastEventTs: now - 1000 * 60 * 60 * 52,
+    liveness: "live",
+    openedTs: 0,
+  },
 ];
 
 const demoDetail: FileDetail = {
@@ -180,6 +202,49 @@ const demoDetail: FileDetail = {
   },
 };
 
+/** Demo detail for the index-only (cold-zone) file: Q3 must degrade honestly. */
+const demoSkipDetail: FileDetail = {
+  ...demoDetail,
+  file: demoFiles[2],
+  versions: [],
+  copies: [],
+  related: [],
+  graph: { ...demoDetail.graph, nodes: demoDetail.graph.nodes.slice(0, 2), edges: [] },
+  answers: {
+    origin: {
+      headline: "来源未知",
+      detail: "没有找到任何来源记录；索引范围外的文件不回填下载器 / 浏览器来源证据。",
+      confidence: "low",
+    },
+    modifiers: {
+      headline: "尚未捕获到写入进程",
+      detail: "该文件在指纹范围外，实时监控不产生事件，也没有进程归因。",
+      confidence: "low",
+    },
+    safety: {
+      headline: "未计算内容指纹",
+      detail: "该文件仅建立索引（在指纹范围外），未计算内容指纹，无法判断删除后果",
+      confidence: "low",
+    },
+  },
+  verdict: {
+    headline: "暂时无法判断删除后果",
+    detail:
+      "来源与写入者都缺乏证据，且此文件在指纹范围外、没有内容指纹，现在删除可能丢掉无法再获得的内容。",
+    confidence: "low",
+    score: 32,
+    drivers: [
+      "来源证据：无可用的来源证据 · 无证据（strength=0）",
+      "内容指纹状态：skip（在指纹范围外，不参与计算）",
+    ],
+    caveats: [
+      "ETW 内核事件流未启用（未提权或被配置关闭），写入者归因只有句柄近似",
+      "该文件仅建立索引（在指纹范围外），未计算内容指纹，无法判断删除后果",
+    ],
+    action: "verify_first",
+  },
+};
+
 /** Demo mode mirrors the backend's server-side kind filter. */
 function demoFiltered(query: string, kind: string): FileRow[] {
   const q = query.trim().toLowerCase();
@@ -192,16 +257,30 @@ function demoFiltered(query: string, kind: string): FileRow[] {
 
 export async function getStatus(): Promise<Status> {
   if (!isTauri()) {
+    // Query flags are demo-only smoke-test hooks: they let a reviewer see the
+    // indexing / truncated / FTS-off states without a Tauri shell.
+    const flags = new URLSearchParams(
+      typeof window === "undefined" ? "" : window.location.search,
+    );
+    const truncated = flags.get("scanTruncated") === "1";
+    const indexing = flags.get("indexing") === "1";
+    const ftsOff = flags.get("ftsOff") === "1";
     return {
       watching: true,
       dirs: ["C:\\Users\\Demo\\Downloads", "C:\\Users\\Demo\\Desktop", "C:\\Users\\Demo\\Documents"],
+      hotDirs: ["C:\\Users\\Demo\\Downloads", "C:\\Users\\Demo\\Desktop", "C:\\Users\\Demo\\Documents"],
+      indexRoots: ["C:\\", "D:\\"],
+      indexState: indexing ? "indexing" : "done",
+      ftsEnabled: !ftsOff,
+      scanTruncated: truncated,
+      watchScope: "固定磁盘根目录（递归 watch）",
       fileCount: demoFiles.length,
       eventCount: 4,
       hashedCount: 2,
       pendingHash: 0,
-      scanState: "ready",
-      scanTotal: 2,
-      scanDone: 2,
+      scanState: indexing ? "indexing" : "ready",
+      scanTotal: truncated ? 1_000_000 : demoFiles.length,
+      scanDone: truncated ? 1_000_000 : demoFiles.length,
       eventsThisSession: 1,
       attributionHits: 2,
       attributionMisses: 2,
@@ -233,7 +312,7 @@ export async function getStatus(): Promise<Status> {
       incrementalHashes: 1,
       recentEntries: 12,
       totalDbSize: 393_216,
-      schemaVersion: 3,
+      schemaVersion: 4,
     };
   }
   return invoke<Status>("get_status");
@@ -260,6 +339,7 @@ export async function countFiles(query: string, kind = ""): Promise<number> {
 
 export async function getFileDetail(id: number): Promise<FileDetail | null> {
   if (!isTauri()) {
+    if (id === demoSkipDetail.file.id) return demoSkipDetail;
     return id === demoDetail.file.id ? demoDetail : null;
   }
   return invoke<FileDetail | null>("get_file_detail", { id });

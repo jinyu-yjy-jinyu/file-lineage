@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 
 use crate::attrib::Attribution;
 use crate::fingerprint::ChunkDigest;
@@ -10,7 +12,10 @@ use crate::util::{human_size, month_bounds_ms, now_ms};
 use crate::verdict;
 
 /// Bumped whenever a table/column layout changes.
-pub const SCHEMA_VERSION: i64 = 3;
+/// v4 (0.4.0): `files.last_event_ts` materializes the ordering timestamp so a
+/// million-row index no longer needs a correlated `MAX(events.ts)` subquery per
+/// row, and `files_fts` (when SQLite was built with FTS5) accelerates search.
+pub const SCHEMA_VERSION: i64 = 4;
 /// Bumped only when the digest algorithm or its inputs change.
 pub const HASH_ALGO_VERSION: &str = "2";
 
@@ -109,7 +114,8 @@ CREATE TABLE IF NOT EXISTS files (
     volume_serial INTEGER,
     file_index    INTEGER,
     chunk_count   INTEGER NOT NULL DEFAULT 0,
-    opened_ts     INTEGER NOT NULL DEFAULT 0
+    opened_ts     INTEGER NOT NULL DEFAULT 0,
+    last_event_ts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -144,6 +150,9 @@ CREATE INDEX IF NOT EXISTS idx_events_file ON events(file_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_events_proc ON events(process_name);
 CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
+-- v4: ORDER BY f.last_event_ts must be able to use an index instead of a
+-- temporary b-tree over the whole (potentially million-row) table.
+CREATE INDEX IF NOT EXISTS idx_files_last_event ON files(last_event_ts DESC);
 "#;
 
 /// Columns added after V1, applied by `migrate` to existing databases.
@@ -157,23 +166,32 @@ const V2_COLUMNS: &[(&str, &str)] = &[
     // Deliberately NOT indexed: they are only read per file row.
     ("source_evidence", "TEXT NOT NULL DEFAULT ''"),
     ("source_strength", "INTEGER NOT NULL DEFAULT 0"),
+    // 0.4.0 (schema v4): materialized "newest event" timestamp. Existing rows
+    // are backfilled from `events` once (see `backfill_v4`); `0` means "not
+    // backfilled yet", which is also the fresh-row default.
+    ("last_event_ts", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Bare column names on the right-hand side refer to the *pre-update* row,
 /// which lets us invalidate the content fingerprint only when size/mtime
-/// actually changed (metadata-only touches otherwise cost nothing).
+/// actually changed. A changed hot file goes to `settling`, not straight to
+/// `pending`: the hash thread only promotes it once the write burst has gone
+/// quiet, so an in-progress download is never digested repeatedly.
 ///
-/// A changed file goes to `settling`, not straight to `pending`: the hash
-/// thread only promotes it once the write burst has gone quiet, so an
-/// in-progress download is never digested repeatedly.
+/// ?14 is the *index scope*: `hot` = inside the fingerprint/real-time range
+/// (goes to `settling` and gets a baseline event), `cold` = index-only (`skip`,
+/// no event, never hashed). Everything else about the upsert is unchanged, so
+/// existing Windows hot-dir behaviour stays intact.
 const UPSERT_SQL: &str = r#"
 INSERT INTO files
     (path, name, ext, size, mtime, source_kind, source_label, source_detail,
      source_evidence, source_strength,
      hash_state, created_at, last_seen_at, change_count, liveness,
-     volume_serial, file_index)
+     volume_serial, file_index, last_event_ts)
 VALUES
-    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?12, ?13, 'settling', ?9, ?9, 0, 'live', ?10, ?11)
+    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?12, ?13,
+     CASE WHEN ?14 = 'hot' THEN 'settling' ELSE 'skip' END,
+     ?9, ?9, 0, 'live', ?10, ?11, ?9)
 ON CONFLICT(path) DO UPDATE SET
     last_seen_at  = excluded.last_seen_at,
     liveness      = 'live',
@@ -187,9 +205,14 @@ ON CONFLICT(path) DO UPDATE SET
     content_hash  = CASE WHEN size <> excluded.size OR mtime <> excluded.mtime
                          THEN NULL ELSE content_hash END,
     hash_state    = CASE WHEN size <> excluded.size OR mtime <> excluded.mtime
-                         THEN 'settling' ELSE hash_state END,
+                         THEN (CASE WHEN ?14 = 'hot' THEN 'settling' ELSE 'skip' END)
+                         WHEN ?14 = 'hot' AND hash_state = 'skip' THEN 'settling'
+                         ELSE hash_state END,
     hash_reason   = CASE WHEN size <> excluded.size OR mtime <> excluded.mtime
                          THEN NULL ELSE hash_reason END,
+    last_event_ts = CASE WHEN size <> excluded.size OR mtime <> excluded.mtime
+                         THEN MAX(last_event_ts, excluded.created_at)
+                         ELSE last_event_ts END,
     size          = excluded.size,
     mtime         = excluded.mtime
 "#;
@@ -203,15 +226,60 @@ SELECT id, 'observed', ?2, ?3, 'baseline',
    AND NOT EXISTS (SELECT 1 FROM events e WHERE e.file_id = files.id)
 "#;
 
+/// FTS5 is a *runtime* capability, not a compile-time one: some distributions
+/// link a SQLite without the trigram tokenizer. Creating the virtual table is
+/// therefore itself the probe (`install_fts` rolls the savepoint back on
+/// failure), and every query has a LIKE fallback.
+///
+/// `content='files'` keeps only the searchable text in the FTS index; the three
+/// triggers mirror inserts/deletes/name-path updates into it. `rebuild`
+/// populates it from pre-existing rows during the v4 backfill.
+/// Separate statements on purpose: `execute_batch` has to track SQLite's
+/// statement tail across `CREATE TRIGGER … BEGIN … END;`, and a single
+/// `conn.execute` per statement removes that whole class of surprise.
+const FTS_SCHEMA: &[&str] = &[
+    "CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+         name, path, content='files', content_rowid='id', tokenize='trigram'
+     )",
+    "CREATE TRIGGER IF NOT EXISTS files_fts_ai AFTER INSERT ON files BEGIN
+         INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS files_fts_ad AFTER DELETE ON files BEGIN
+         INSERT INTO files_fts(files_fts, rowid, name, path)
+           VALUES ('delete', old.id, old.name, old.path);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS files_fts_au AFTER UPDATE OF name, path ON files BEGIN
+         INSERT INTO files_fts(files_fts, rowid, name, path)
+           VALUES ('delete', old.id, old.name, old.path);
+         INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+     END",
+];
+
 /// `%`/`_` in a user query must be escaped, otherwise searching `a_b` also
 /// matches `axb`. Paired with `ESCAPE '\'` in the SQL.
-fn like_pattern(query: &str) -> String {
-    let escaped = query
+fn escape_like(value: &str) -> String {
+    value
         .to_lowercase()
         .replace('\\', "\\\\")
         .replace('%', "\\%")
-        .replace('_', "\\_");
-    format!("%{}%", escaped)
+        .replace('_', "\\_")
+}
+
+fn like_pattern(query: &str) -> String {
+    format!("%{}%", escape_like(query))
+}
+
+/// A trigram MATCH cannot express "any substring" with bare operators: the
+/// query is a quoted phrase so punctuation stays literal. Doubling `"` is
+/// FTS5's escape for a quote inside a string.
+fn fts_match_query(query: &str) -> String {
+    format!("\"{}\"", query.replace('"', "\"\""))
+}
+
+/// A query shorter than 3 codepoints (e.g. a two-character Chinese word) has
+/// no trigram to match, so it must stay on the LIKE path.
+fn fts_usable(query: &str) -> bool {
+    query.chars().count() >= 3
 }
 
 const LIST_SQL: &str = r#"
@@ -223,18 +291,47 @@ SELECT f.id, f.path, f.name, f.ext, f.size, f.mtime,
            AND d.content_hash = f.content_hash
            AND d.id <> f.id
            AND d.liveness = 'live') AS dup_count,
-       COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.file_id = f.id), f.created_at) AS last_ts,
+       f.last_event_ts AS last_ts,
        f.created_at, f.opened_ts, f.source_evidence, f.source_strength
   FROM files f
  WHERE (?1 = '' OR lower(f.name) LIKE ?2 ESCAPE '\' OR lower(f.path) LIKE ?2 ESCAPE '\')
    AND (?5 = '' OR f.source_kind = ?5)
- ORDER BY last_ts DESC
+ ORDER BY f.last_event_ts DESC
  LIMIT ?3 OFFSET ?4
 "#;
 
 /// Note on `ESCAPE '\'`: this string is a Rust raw string, so the SQL the
 /// engine receives is literally `ESCAPE '\'` — a one-character backslash
 /// escape clause, exactly what SQLite requires.
+
+/// FTS counterpart of `LIST_SQL`, with the exact same parameter shape (`?2`
+/// carries a quoted phrase instead of a LIKE pattern). Filtering the FTS hit
+/// set in a subquery keeps the join against the wide `files` rows cheap.
+const LIST_FTS_SQL: &str = r#"
+SELECT f.id, f.path, f.name, f.ext, f.size, f.mtime,
+       f.source_kind, f.source_label, f.source_detail,
+       f.change_count, f.content_hash, f.hash_state, f.liveness,
+       (SELECT COUNT(*) FROM files d
+         WHERE d.content_hash IS NOT NULL
+           AND d.content_hash = f.content_hash
+           AND d.id <> f.id
+           AND d.liveness = 'live') AS dup_count,
+       f.last_event_ts AS last_ts,
+       f.created_at, f.opened_ts, f.source_evidence, f.source_strength
+  FROM files f
+  JOIN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?2) m ON m.rowid = f.id
+ WHERE (?5 = '' OR f.source_kind = ?5)
+ ORDER BY f.last_event_ts DESC
+ LIMIT ?3 OFFSET ?4
+"#;
+
+/// Parameter shape is unchanged from `COUNT_SQL`; when a kind filter is active
+/// the FTS hit set has to be joined back to `files` before counting.
+const COUNT_FTS_SQL: &str = r#"
+SELECT COUNT(*) FROM files f
+  JOIN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?2) m ON m.rowid = f.id
+ WHERE (?3 = '' OR f.source_kind = ?3)
+"#;
 
 const COUNT_SQL: &str = r#"
 SELECT COUNT(*) FROM files f
@@ -250,7 +347,7 @@ SELECT f.id, f.path, f.name, f.ext, f.size, f.mtime,
          WHERE d.content_hash IS NOT NULL
            AND d.content_hash = f.content_hash
            AND d.id <> f.id AND d.liveness = 'live'),
-       COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.file_id = f.id), f.created_at),
+       f.last_event_ts,
        f.created_at, f.opened_ts, f.source_evidence, f.source_strength
   FROM files f WHERE f.id = ?1
 "#;
@@ -278,9 +375,12 @@ pub struct Store {
     archive_dir: PathBuf,
     /// Lazily opened read-only archive databases, keyed by file name.
     archives: Mutex<Option<Vec<(PathBuf, Connection)>>>,
-    /// Directories the collector watches. A "unique copy" conclusion is only
-    /// meaningful for files inside them.
+    /// Directories inside the fingerprint / real-time scope ("hot dirs"). A
+    /// "unique copy" conclusion is only meaningful for files inside them.
     watch_dirs: Mutex<Vec<PathBuf>>,
+    /// Whether this SQLite actually supports FTS5 trigram. Probed at open;
+    /// `false` makes every query take the LIKE path.
+    fts_enabled: AtomicBool,
     /// `(computed_at_ms, stats)` — see [`Store::stats`].
     stats_cache: Mutex<Option<(i64, DbStats)>>,
     /// Last non-fatal storage error, surfaced through `Status::last_error`.
@@ -296,9 +396,7 @@ impl Store {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-        conn.execute_batch(SCHEMA_TABLES)?;
-        migrate(&conn)?;
-        conn.execute_batch(SCHEMA_INDEXES)?;
+        let (fts_enabled, initial_error) = prepare_schema(&conn)?;
 
         let archive_dir = path
             .parent()
@@ -312,13 +410,19 @@ impl Store {
             archive_dir,
             archives: Mutex::new(None),
             watch_dirs: Mutex::new(Vec::new()),
+            fts_enabled: AtomicBool::new(fts_enabled),
             stats_cache: Mutex::new(None),
-            last_error: Mutex::new(None),
+            last_error: Mutex::new(initial_error),
         })
     }
 
-    /// Record the directories the collector watches. Called once at startup;
-    /// used by the Q3 coverage rule ("唯一副本" only holds inside them).
+    pub fn fts_enabled(&self) -> bool {
+        self.fts_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Record the fingerprint-scope directories. Called once at startup; used by
+    /// the Q3 coverage rule ("唯一副本" only holds inside them) and to bound
+    /// name-based backfill matches.
     pub fn set_watch_dirs(&self, dirs: Vec<PathBuf>) {
         if let Ok(mut guard) = self.watch_dirs.lock() {
             *guard = dirs;
@@ -357,11 +461,14 @@ impl Store {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-        conn.execute_batch(SCHEMA_TABLES)?;
-        migrate(&conn)?;
-        conn.execute_batch(SCHEMA_INDEXES)?;
+        let (fts_enabled, initial_error) = prepare_schema(&conn)?;
         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         *guard = conn;
+        drop(guard);
+        self.fts_enabled.store(fts_enabled, Ordering::Relaxed);
+        if let Some(message) = initial_error {
+            self.set_last_error(message);
+        }
         Ok(())
     }
 
@@ -431,10 +538,19 @@ impl Store {
 
     // ------------------------------------------------------------- writing
 
-    /// Fast path for the initial directory walk: one transaction per chunk.
-    pub fn register_batch(
+    /// Fast path for the directory walk: one transaction per chunk.
+    ///
+    /// `scope = "hot"` behaves exactly like the old `register_batch` (a
+    /// baseline `observed` event + `settling`). `scope = "cold"` creates an
+    /// index-only row (`hash_state = 'skip'`) with **no event**, which is what
+    /// keeps a full-disk index from inflating `events` by a million rows.
+    /// Stats invalidation is deliberately left to the caller: the indexer
+    /// throttles it to every 20k files, and per-batch invalidation made the
+    /// 5 s status cache useless during a scan.
+    pub fn register_batch_scoped(
         &self,
         items: &[(FileObservation, SourceInfo)],
+        scope: &str,
     ) -> rusqlite::Result<usize> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -442,6 +558,9 @@ impl Store {
         {
             let mut upsert = tx.prepare_cached(UPSERT_SQL)?;
             let mut baseline = tx.prepare_cached(BASELINE_EVENT_SQL)?;
+            let mut touch = tx.prepare_cached(
+                "UPDATE files SET last_event_ts = MAX(last_event_ts, ?1) WHERE path = ?2",
+            )?;
             for (obs, src) in items {
                 upsert.execute(params![
                     obs.path,
@@ -456,17 +575,43 @@ impl Store {
                     obs.volume,
                     obs.file_index,
                     src.evidence,
-                    src.strength
+                    src.strength,
+                    scope
                 ])?;
-                baseline.execute(params![obs.path, now, obs.size])?;
+                if scope == "hot" {
+                    let inserted = baseline.execute(params![obs.path, now, obs.size])?;
+                    if inserted > 0 {
+                        touch.execute(params![now, obs.path])?;
+                    }
+                }
             }
         }
         tx.commit()?;
-        self.invalidate_stats();
         Ok(items.len())
     }
 
+    /// Compatibility wrapper: registration from a real-time hot-dir event is
+    /// always in scope.
+    #[allow(dead_code)]
+    pub fn register_batch(
+        &self,
+        items: &[(FileObservation, SourceInfo)],
+    ) -> rusqlite::Result<usize> {
+        self.register_batch_scoped(items, "hot")
+    }
+
     pub fn upsert_file(&self, obs: &FileObservation, src: &SourceInfo) -> rusqlite::Result<i64> {
+        self.upsert_file_scoped(obs, src, "hot")
+    }
+
+    /// Cold-zone events only refresh the index row: no baseline event, no
+    /// process attribution, no fingerprint queue entry.
+    pub fn upsert_file_scoped(
+        &self,
+        obs: &FileObservation,
+        src: &SourceInfo,
+        scope: &str,
+    ) -> rusqlite::Result<i64> {
         let conn = self.lock();
         let now = now_ms();
         conn.execute(
@@ -484,7 +629,8 @@ impl Store {
                 obs.volume,
                 obs.file_index,
                 src.evidence,
-                src.strength
+                src.strength,
+                scope
             ],
         )?;
         conn.query_row(
@@ -610,8 +756,10 @@ impl Store {
             params![file_id, kind, ts, size, pname, ppath, pid, method, note],
         )?;
         conn.execute(
-            "UPDATE files SET change_count = change_count + 1 WHERE id = ?1",
-            params![file_id],
+            "UPDATE files SET change_count = change_count + 1,
+                    last_event_ts = MAX(last_event_ts, ?2)
+              WHERE id = ?1",
+            params![file_id, ts],
         )?;
         self.invalidate_stats();
         Ok(true)
@@ -641,7 +789,9 @@ impl Store {
             .optional()?;
         if already.is_some() {
             conn.execute(
-                "UPDATE files SET opened_ts = ?1 WHERE id = ?2",
+                "UPDATE files SET opened_ts = ?1,
+                        last_event_ts = MAX(last_event_ts, ?1)
+                  WHERE id = ?2",
                 params![ts, file_id],
             )?;
             return Ok(false);
@@ -652,7 +802,9 @@ impl Store {
             params![file_id, ts, note],
         )?;
         conn.execute(
-            "UPDATE files SET opened_ts = ?1 WHERE id = ?2",
+            "UPDATE files SET opened_ts = ?1,
+                    last_event_ts = MAX(last_event_ts, ?1)
+              WHERE id = ?2",
             params![ts, file_id],
         )?;
         Ok(true)
@@ -678,6 +830,10 @@ impl Store {
              VALUES (?1, 'downloaded', ?2, 0, 'download-task', ?3)",
             params![file_id, ts, note],
         )?;
+        conn.execute(
+            "UPDATE files SET last_event_ts = MAX(last_event_ts, ?1) WHERE id = ?2",
+            params![ts, file_id],
+        )?;
         Ok(true)
     }
 
@@ -689,12 +845,120 @@ impl Store {
         Ok(())
     }
 
+    /// Live rows in `id` order, for the nightly `exists()` sweep. Paging by id
+    /// keeps memory bounded on a million-row index.
+    pub fn live_paths_after(&self, after_id: i64, limit: i64) -> Vec<(i64, String)> {
+        let conn = self.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT id, path FROM files
+              WHERE liveness = 'live' AND id > ?1 ORDER BY id LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        match stmt.query_map(params![after_id, limit], |r| Ok((r.get(0)?, r.get(1)?))) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// One transaction per 1,000 ids: a nightly sweep must not hold the WAL
+    /// write lock for the entire `files` table.
+    pub fn mark_gone_batch(&self, ids: &[i64]) -> rusqlite::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached("UPDATE files SET liveness = 'gone' WHERE id = ?1")?;
+            for id in ids {
+                stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(ids.len())
+    }
+
+    /// Fold a completed full-disk index back into the main DB file. A failed
+    /// checkpoint is harmless (the next pass retries), but it must be visible.
+    pub fn checkpoint(&self) {
+        let conn = self.lock();
+        if let Err(error) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            let message = format!("WAL checkpoint 失败（无害，下次重试）：{}", error);
+            crate::startup::log(&message);
+            self.set_last_error(message);
+        }
+    }
+
+    /// One-time v3 → v4 re-scoping: rows inherited from the old three-dir scan
+    /// were all `settling`/`pending`. Now that the index covers the whole disk,
+    /// only rows under the hot (fingerprint) dirs may enter the hash queue;
+    /// everything else becomes `skip`. A meta guard makes this idempotent
+    /// across restarts and `reopen()`.
+    pub fn rescope_legacy_hot(&self, hot_dirs: &[PathBuf]) {
+        let conn = self.lock();
+        let done: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'v4_rescope_done'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if done.as_deref() == Some("1") || hot_dirs.is_empty() {
+            return;
+        }
+        let mut sql = String::from(
+            "UPDATE files SET hash_state = 'skip'
+              WHERE hash_state IN ('settling','pending') AND liveness = 'live'
+                AND NOT (",
+        );
+        let mut values: Vec<Value> = Vec::new();
+        for (i, dir) in hot_dirs.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR ");
+            }
+            // ESCAPE '\' in a normal Rust string needs a doubled backslash.
+            sql.push_str(&format!("lower(path) LIKE ?{} ESCAPE '\\'", i + 1));
+            values.push(Value::Text(format!(
+                "{}%",
+                escape_like(&dir.to_string_lossy())
+            )));
+        }
+        sql.push(')');
+        let result = conn
+            .execute(&sql, params_from_iter(values))
+            .and_then(|_| {
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('v4_rescope_done', '1')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )
+            });
+        if let Err(error) = result {
+            let message = format!("旧库指纹范围重定界失败：{}", error);
+            crate::startup::log(&message);
+            self.set_last_error(message);
+        }
+    }
+
     pub fn id_for_path(&self, path: &str) -> Option<i64> {
         let conn = self.lock();
         conn.query_row("SELECT id FROM files WHERE path = ?1", params![path], |r| {
             r.get(0)
         })
         .ok()
+    }
+
+    /// Exact-path lookup restricted to the fingerprint scope, so a downloader
+    /// record can never attach itself to a same-named cold-zone file.
+    pub fn id_for_path_in_scope(&self, path: &str) -> Option<i64> {
+        if !self.is_watched(path) {
+            return None;
+        }
+        self.id_for_path(path)
     }
 
     pub fn identity_for_path(&self, path: &str) -> Option<(Option<i64>, Option<i64>)> {
@@ -708,28 +972,58 @@ impl Store {
     }
 
     /// Every tracked file with this exact name (case-insensitive), narrowed by
-    /// extension and size when the caller knows them.
+    /// extension and size when the caller knows them, and **bounded to the hot
+    /// (fingerprint) dirs**.
     ///
     /// Name-only matching is what made "open `/Downloads/report.pdf`" write an
-    /// `opened` event onto *every* `report.pdf` in the database, so callers
-    /// pass whatever the source record knows (`""`/`0` = unknown, keep).
+    /// `opened` event onto *every* `report.pdf` in the database. With a
+    /// full-disk index there may be dozens of same-named files, so the prefix
+    /// filter is part of the SQL: applying it after `LIMIT 200` would silently
+    /// discard all in-scope rows.
     pub fn ids_by_name(&self, name: &str, ext: &str, size: i64) -> Vec<(i64, String)> {
-        let conn = self.lock();
-        let mut stmt = match conn.prepare(
+        let hot: Vec<PathBuf> = self
+            .watch_dirs
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let mut sql = String::from(
             "SELECT id, path FROM files
               WHERE lower(name) = ?1 AND liveness = 'live'
                 AND (?2 = '' OR ext = ?2)
-                AND (?3 <= 0 OR size <= 0 OR size = ?3)
-              LIMIT 200",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let rows = stmt.query_map(
-            params![name.to_lowercase(), ext.to_lowercase(), size],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+                AND (?3 <= 0 OR size <= 0 OR size = ?3)",
         );
-        match rows {
+        let mut values: Vec<Value> = vec![
+            Value::Text(name.to_lowercase()),
+            Value::Text(ext.to_lowercase()),
+            Value::Integer(size),
+        ];
+        if !hot.is_empty() {
+            sql.push_str(" AND (");
+            for (i, dir) in hot.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" OR ");
+                }
+                sql.push_str(&format!(
+                    "lower(path) LIKE ?{} ESCAPE '\\'",
+                    values.len() + 1
+                ));
+                values.push(Value::Text(format!(
+                    "{}%",
+                    escape_like(&dir.to_string_lossy())
+                )));
+            }
+            sql.push(')');
+        }
+        sql.push_str(" LIMIT 200");
+        let conn = self.lock();
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(error) => {
+                crate::startup::log(&format!("按文件名匹配准备失败：{}", error));
+                return Vec::new();
+            }
+        };
+        match stmt.query_map(params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?))) {
             Ok(rows) => rows.flatten().collect(),
             Err(_) => Vec::new(),
         }
@@ -955,26 +1249,49 @@ impl Store {
 
     /// `kind` filters server-side (`""` = all) so a filter chip can never show
     /// an empty list while matching rows exist further down the table.
+    ///
+    /// FTS5 is tried only when it was probed successfully and the query has at
+    /// least three codepoints (trigram's minimum). Any SQL error falls back to
+    /// the LIKE path and is logged, so a broken index can never blank the list.
     pub fn list_files(&self, query: &str, kind: &str, limit: i64, offset: i64) -> Vec<FileRow> {
         let conn = self.lock();
-        let mut stmt = match conn.prepare(LIST_SQL) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let pattern = like_pattern(query);
-        let rows = stmt.query_map(
-            params![query, pattern, limit, offset, kind],
-            row_to_file,
-        );
-        match rows {
-            Ok(rows) => rows.flatten().collect(),
-            Err(_) => Vec::new(),
+        if self.fts_enabled() && fts_usable(query) {
+            let filter = fts_match_query(query);
+            if let Some(rows) = query_files(
+                &*conn,
+                LIST_FTS_SQL,
+                params![query, filter, limit, offset, kind],
+            ) {
+                return rows;
+            }
+            crate::startup::log("FTS5 列表查询失败，本次回退 LIKE 路径");
         }
+        query_files(
+            &*conn,
+            LIST_SQL,
+            params![query, like_pattern(query), limit, offset, kind],
+        )
+        .unwrap_or_default()
     }
 
     /// Total rows matching the same filter as [`Store::list_files`].
     pub fn count_files(&self, query: &str, kind: &str) -> i64 {
         let conn = self.lock();
+        if self.fts_enabled() && fts_usable(query) {
+            let filter = fts_match_query(query);
+            let result = conn.query_row(
+                COUNT_FTS_SQL,
+                params![query, filter, kind],
+                |r| r.get::<_, i64>(0),
+            );
+            match result {
+                Ok(count) => return count,
+                Err(error) => crate::startup::log(&format!(
+                    "FTS5 计数查询失败，本次回退 LIKE 路径：{}",
+                    error
+                )),
+            }
+        }
         conn.query_row(
             COUNT_SQL,
             params![query, like_pattern(query), kind],
@@ -1351,6 +1668,125 @@ fn archive_month(
     (result.ok(), detach_failed)
 }
 
+/// Schema bootstrap shared by `open` and `reopen`: the three-phase order is
+/// load-bearing (tables → column migration → indexes), because an index over a
+/// column that `migrate` still has to add kills the whole batch on a V3 DB.
+///
+/// FTS installation and the v4 backfill are best-effort: a missing FTS5 build
+/// or an interrupted backfill must never stop the GUI from starting. Errors are
+/// logged to startup.log *and* returned so they reach `Status.last_error`.
+fn prepare_schema(conn: &Connection) -> rusqlite::Result<(bool, Option<String>)> {
+    conn.execute_batch(SCHEMA_TABLES)?;
+    migrate(conn)?;
+    conn.execute_batch(SCHEMA_INDEXES)?;
+    let fts_enabled = install_fts(conn);
+    let mut error = match backfill_v4(conn, fts_enabled) {
+        Ok(()) => None,
+        Err(error) => {
+            let message = format!("v4 回填未完成（下次启动会续跑）：{}", error);
+            crate::startup::log(&message);
+            Some(message)
+        }
+    };
+    if !fts_enabled {
+        // A build without FTS5 is a supported degradation, but it must be
+        // visible in the UI (Status.last_error) and in startup.log.
+        let message = "FTS5/trigram 不可用，搜索已回退 LIKE 路径".to_string();
+        crate::startup::log(&message);
+        error = Some(match error {
+            Some(previous) => format!("{}；{}", previous, message),
+            None => message,
+        });
+    }
+    Ok((fts_enabled, error))
+}
+
+/// Creating the virtual table *is* the probe: SQLite without FTS5 (or without
+/// the trigram tokenizer) rejects it. A savepoint keeps a partial install from
+/// leaving a table behind with no triggers.
+fn install_fts(conn: &Connection) -> bool {
+    if conn.execute_batch("SAVEPOINT fl_fts;").is_err() {
+        return false;
+    }
+    let result: rusqlite::Result<()> = FTS_SCHEMA
+        .iter()
+        .try_for_each(|statement| conn.execute(*statement, []).map(|_| ()));
+    match result {
+        Ok(()) => {
+            let _ = conn.execute_batch("RELEASE fl_fts;");
+            true
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK TO fl_fts; RELEASE fl_fts;");
+            crate::startup::log(&format!("FTS5 不可用，搜索回退 LIKE：{}", error));
+            false
+        }
+    }
+}
+
+/// One-shot v3 → v4 data repair, guarded by `meta.v4_backfill_done`.
+///
+/// Each 5,000-row `UPDATE` is a single autocommit statement, i.e. its own
+/// transaction: a crash or a slow disk can never leave a half-written batch,
+/// and `WHERE last_event_ts = 0` makes a resumed run a no-op for finished rows.
+fn backfill_v4(conn: &Connection, fts_enabled: bool) -> rusqlite::Result<()> {
+    // FTS has its own guard: a build without FTS5 must not consume the
+    // `v4_backfill_done` flag for a later build that *does* ship FTS5 (that
+    // would leave an empty index whose queries silently return zero rows).
+    if fts_enabled {
+        let rebuilt: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'v4_fts_rebuilt'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if rebuilt.as_deref() != Some("1") {
+            conn.execute("INSERT INTO files_fts(files_fts) VALUES('rebuild')", [])?;
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('v4_fts_rebuilt', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+        }
+    }
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('v4_backfill_done', '0')
+         ON CONFLICT(key) DO NOTHING",
+        [],
+    )?;
+    let done: String = conn.query_row(
+        "SELECT value FROM meta WHERE key = 'v4_backfill_done'",
+        [],
+        |r| r.get(0),
+    )?;
+    if done == "1" {
+        return Ok(());
+    }
+    let max_id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM files", [], |r| r.get(0))?;
+    const BATCH: i64 = 5_000;
+    let mut lo = 1i64;
+    while lo <= max_id {
+        let hi = lo + BATCH - 1;
+        conn.execute(
+            "UPDATE files SET last_event_ts =
+                 COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.file_id = files.id), created_at)
+              WHERE last_event_ts = 0 AND id BETWEEN ?1 AND ?2",
+            params![lo, hi],
+        )?;
+        if (lo / BATCH) % 10 == 0 {
+            crate::startup::log(&format!(
+                "v4 回填：已处理 id {} / {}",
+                hi.min(max_id),
+                max_id
+            ));
+        }
+        lo = hi + 1;
+    }
+    conn.execute("UPDATE meta SET value = '1' WHERE key = 'v4_backfill_done'", [])?;
+    Ok(())
+}
+
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let existing: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
@@ -1399,6 +1835,18 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         params![HASH_ALGO_VERSION],
     )?;
     Ok(())
+}
+
+/// Shared list-query runner. `None` means "this SQL path failed" so the caller
+/// can fall back to LIKE; `Some(vec![])` is a genuine empty result.
+fn query_files<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    args: P,
+) -> Option<Vec<FileRow>> {
+    let mut stmt = conn.prepare(sql).ok()?;
+    let rows = stmt.query_map(args, row_to_file).ok()?;
+    Some(rows.flatten().collect())
 }
 
 fn row_to_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
@@ -1626,13 +2074,20 @@ fn build_answers(
     };
 
     let (safety_headline, safety_detail) = if !safety.ready() {
-        (
-            "内容指纹尚未生成".to_string(),
-            format!(
-                "后台哈希队列状态：{}。完成后才能判断是否存在相同内容的其他副本。",
-                file.hash_state
-            ),
-        )
+        if file.hash_state == "skip" {
+            (
+                "未计算内容指纹".to_string(),
+                "该文件仅建立索引（在指纹范围外），未计算内容指纹，无法判断删除后果".to_string(),
+            )
+        } else {
+            (
+                "内容指纹尚未生成".to_string(),
+                format!(
+                    "后台哈希队列状态：{}。完成后才能判断是否存在相同内容的其他副本。",
+                    file.hash_state
+                ),
+            )
+        }
     } else if !real_copies.is_empty() {
         let mut lines: Vec<String> = Vec::new();
         lines.push(format!("内容完全相同的独立副本 {} 个：", real_copies.len()));
@@ -1681,7 +2136,7 @@ fn build_answers(
         (
             "唯一副本，删除会丢内容".to_string(),
             format!(
-                "在已监控目录中，BLAKE3 指纹 {}… 只出现一次（{}），且库内没有未完成指纹的文件。删除后本机不再有相同内容。{}{}",
+                "在指纹范围目录中，BLAKE3 指纹 {}… 只出现一次（{}），且库内没有未完成指纹的文件。删除后本机不再有相同内容。{}{}",
                 fingerprint,
                 human_size(file.size),
                 extra,
@@ -1692,7 +2147,7 @@ fn build_answers(
         (
             "可能是唯一副本，但指纹覆盖不完整".to_string(),
             format!(
-                "在已监控目录中，BLAKE3 指纹 {}… 暂时没有匹配到副本；但库内仍有 {} 个文件未完成指纹，其中可能包含相同内容。建议等指纹队列清空后再判断。{}",
+                "在指纹范围目录中，BLAKE3 指纹 {}… 暂时没有匹配到副本；但库内仍有 {} 个文件未完成指纹，其中可能包含相同内容。建议等指纹队列清空后再判断。{}",
                 fingerprint,
                 safety.pending_unhashed,
                 related_note
@@ -1877,5 +2332,215 @@ fn event_label(kind: &str) -> String {
         "opened" => "被打开".into(),
         "downloaded" => "下载".into(),
         other => other.to_string(),
+    }
+}
+
+// ------------------------------------------------------------------ tests
+//
+// CI runs these on macOS/Linux (`cargo test --lib`); they pin the v4 migration,
+// scope branches and the FTS/LIKE query equivalence that cannot be checked by
+// `cargo check` alone.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Explicit imports: a glob through `super::*` is not a reliable way to
+    // bring a macro or a private re-export into a test module.
+    use crate::util::now_ms;
+    use rusqlite::params;
+    use std::sync::atomic::Ordering;
+
+    fn temp_db(label: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "fl-v4-{}-{}-{}.db",
+            label,
+            std::process::id(),
+            now_ms()
+        ));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.to_string_lossy(), suffix));
+        }
+        path
+    }
+
+    fn cleanup(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.to_string_lossy(), suffix));
+        }
+    }
+
+    fn store(label: &str) -> (Store, PathBuf) {
+        let path = temp_db(label);
+        let s = Store::open(&path).expect("store open");
+        (s, path)
+    }
+
+    fn obs(name: &str) -> FileObservation {
+        FileObservation {
+            path: format!("/tmp/{}", name),
+            name: name.to_string(),
+            ext: "txt".to_string(),
+            size: 12,
+            mtime: now_ms(),
+            volume: None,
+            file_index: None,
+        }
+    }
+
+    fn register(store: &Store, o: &FileObservation, scope: &str) {
+        store
+            .register_batch_scoped(&[(o.clone(), SourceInfo::unknown())], scope)
+            .expect("register");
+    }
+
+    fn hash_state(store: &Store, path: &str) -> String {
+        store
+            .lock()
+            .query_row(
+                "SELECT hash_state FROM files WHERE path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn last_event_ts(store: &Store, path: &str) -> i64 {
+        store
+            .lock()
+            .query_row(
+                "SELECT last_event_ts FROM files WHERE path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn event_count(store: &Store) -> i64 {
+        store
+            .lock()
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn v4_migration_is_idempotent_across_reopen() {
+        let (s, path) = store("migration");
+        assert_eq!(s.schema_version(), SCHEMA_VERSION);
+        let columns: Vec<String> = {
+            let conn = s.lock();
+            let mut stmt = conn.prepare("PRAGMA table_info(files)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        assert!(columns.iter().any(|c| c == "last_event_ts"));
+        s.reopen().unwrap();
+        assert_eq!(s.schema_version(), SCHEMA_VERSION);
+        let done: String = s
+            .lock()
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'v4_backfill_done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, "1");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fts_and_like_paths_return_the_same_rows() {
+        let (s, path) = store("fts");
+        let o = obs("report-2026.txt");
+        register(&s, &o, "hot");
+        let via_fts = s.list_files("report", "", 50, 0);
+        s.fts_enabled.store(false, Ordering::Relaxed);
+        let via_like = s.list_files("report", "", 50, 0);
+        assert_eq!(via_fts.len(), 1);
+        assert_eq!(via_like.len(), 1);
+        assert_eq!(via_fts[0].path, via_like[0].path);
+        assert_eq!(s.count_files("report", ""), 1);
+        // <3 codepoints always stays on LIKE, regardless of the probe result.
+        s.fts_enabled.store(true, Ordering::Relaxed);
+        assert_eq!(s.list_files("报", "", 50, 0).len(), 0);
+        assert_eq!(fts_match_query("a\"b"), "\"a\"\"b\"");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn hot_and_cold_registration_have_different_event_and_hash_semantics() {
+        let (s, path) = store("scope");
+        let hot = obs("hot.txt");
+        let cold = obs("cold.txt");
+        register(&s, &hot, "hot");
+        register(&s, &cold, "cold");
+        assert_eq!(hash_state(&s, &hot.path), "settling");
+        assert_eq!(hash_state(&s, &cold.path), "skip");
+        // Only the hot file gets a baseline `observed` event.
+        assert_eq!(event_count(&s), 1);
+
+        let cold_id = s.id_for_path(&cold.path).unwrap();
+        s.promote_settled(now_ms() + 1_000_000, 0).unwrap();
+        assert_eq!(hash_state(&s, &cold.path), "skip");
+        assert!(s
+            .pending_hash_batch(100)
+            .iter()
+            .all(|(id, _, _)| *id != cold_id));
+        assert_eq!(s.pending_hash_count(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn three_event_write_points_maintain_last_event_ts() {
+        let (s, path) = store("timestamps");
+        let o = obs("events.txt");
+        register(&s, &o, "hot");
+        let id = s.id_for_path(&o.path).unwrap();
+        s.record_event(id, "modified", 1_000, 12, None, None).unwrap();
+        s.record_opened(id, 2_000, "recent").unwrap();
+        s.record_download(id, 3_000, "task").unwrap();
+        assert_eq!(last_event_ts(&s, &o.path), 3_000);
+        // MAX() must never move the materialized timestamp backwards.
+        s.record_event(id, "removed", 500, 0, None, None).unwrap();
+        assert_eq!(last_event_ts(&s, &o.path), 3_000);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rescope_legacy_hot_is_idempotent_and_only_touches_out_of_scope_rows() {
+        let (s, path) = store("rescope");
+        let hot = obs("hot.txt");
+        let mut cold = obs("cold.txt");
+        cold.path = "/var/cold.txt".to_string();
+        register(&s, &hot, "hot");
+        register(&s, &cold, "hot");
+        let dirs = vec![PathBuf::from("/tmp")];
+        s.set_watch_dirs(dirs.clone());
+        s.rescope_legacy_hot(&dirs);
+        assert_eq!(hash_state(&s, &hot.path), "settling");
+        assert_eq!(hash_state(&s, &cold.path), "skip");
+        // A second run is a no-op (the meta guard), including for new rows.
+        let mut later = obs("later.txt");
+        later.path = "/var/later.txt".to_string();
+        register(&s, &later, "hot");
+        s.rescope_legacy_hot(&dirs);
+        assert_eq!(hash_state(&s, &later.path), "settling");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn nightly_gone_marking_is_batched() {
+        let (s, path) = store("gone");
+        let a = obs("a.txt");
+        let b = obs("b.txt");
+        register(&s, &a, "cold");
+        register(&s, &b, "cold");
+        let rows = s.live_paths_after(0, 1_000);
+        assert_eq!(rows.len(), 2);
+        let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(s.mark_gone_batch(&ids).unwrap(), 2);
+        assert!(s.live_paths_after(0, 1_000).is_empty());
+        cleanup(&path);
     }
 }

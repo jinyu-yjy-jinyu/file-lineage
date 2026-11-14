@@ -243,16 +243,21 @@ export default function App() {
   }, []);
 
   const visibleFiles = useMemo(() => files, [files]);
-  const collecting = status.scanState === "scanning" || status.scanState === "hashing";
+  const collecting =
+    status.scanState === "scanning" ||
+    status.scanState === "indexing" ||
+    status.scanState === "hashing";
 
   const scanLabel =
-    status.scanState === "scanning"
-      ? `扫描中 · 已处理 ${status.scanDone.toLocaleString()}`
-      : status.scanState === "hashing"
-        ? `指纹计算中 · 待处理 ${status.pendingHash.toLocaleString()}`
-        : status.scanState === "ready"
-          ? "采集就绪"
-          : "待机";
+    status.scanState === "indexing"
+      ? `正在建立全盘索引 · 已处理 ${status.scanDone.toLocaleString()}`
+      : status.scanState === "scanning"
+        ? `扫描中 · 已处理 ${status.scanDone.toLocaleString()}`
+        : status.scanState === "hashing"
+          ? `指纹计算中 · 待处理 ${status.pendingHash.toLocaleString()}`
+          : status.scanState === "ready"
+            ? "采集就绪"
+            : "待机";
 
   return (
     <div className="app">
@@ -271,10 +276,18 @@ export default function App() {
         <div className="topbar-center">
           <span className={`live-dot ${status.watching ? "on" : "off"}`} />
           <span className="live-text">
-            {status.watching ? "后台采集中" : "监控未启动"}
+            {status.watching ? "后台采集中" : "后台采集未启动"}
           </span>
           <span className="divider" />
           <span className="scan-pill">{scanLabel}</span>
+          {status.scanTruncated ? (
+            <span
+              className="truncated-pill"
+              title="索引已达到 config.ini 中 max_scan_files 的上限，可调高后重新扫描"
+            >
+              已达索引上限
+            </span>
+          ) : null}
           {status.pendingHash > 0 ? (
             <span className="pending-pill">指纹队列 {status.pendingHash.toLocaleString()}</span>
           ) : null}
@@ -293,18 +306,31 @@ export default function App() {
       <div className="layout">
         <aside className="sidebar">
           <div className="side-section">
-            <h2>监控目录</h2>
+            <h2>索引范围</h2>
             <ul className="dir-list">
-              {status.dirs.length === 0 ? (
-                <li className="muted">0 个目录可监控（macOS 需在「系统设置 → 隐私与安全性」中授权）</li>
+              {status.indexRoots.length === 0 ? (
+                <li className="muted">尚未确定索引范围（启动后自动枚举固定磁盘）</li>
               ) : null}
-              {status.dirs.map((d) => (
+              {status.indexRoots.map((d) => (
                 <li key={d} title={d}>
                   <span className="dir-icon">▤</span>
+                  <span className="dir-name">{d}</span>
+                </li>
+              ))}
+            </ul>
+            <p className="muted small">指纹与实时范围（热区）</p>
+            <ul className="dir-list compact">
+              {status.hotDirs.length === 0 ? (
+                <li className="muted">0 个目录在指纹范围内（macOS 需在「系统设置 → 隐私与安全性」中授权）</li>
+              ) : null}
+              {status.hotDirs.map((d) => (
+                <li key={d} title={d}>
+                  <span className="dir-icon">◈</span>
                   <span className="dir-name">{basename(d)}</span>
                 </li>
               ))}
             </ul>
+            <p className="muted small">实时监控：{status.watchScope || "尚未启动"}</p>
           </div>
 
           <div className="side-section">
@@ -405,13 +431,18 @@ export default function App() {
               </li>
             </ul>
             <div className="range-note">
-              <strong>监控范围 · v{APP_VERSION}</strong>
+              <strong>索引范围 · v{APP_VERSION}</strong>
               <p>
-                递归监控 下载 / 桌面 / 文档 三个目录（含子目录），回答「从哪来 / 谁改过 / 删了会不会丢」。
+                后台索引所有固定磁盘；指纹与实时监控覆盖常用目录（下载 / 桌面 / 文档 / OneDrive）。
+                Linux 实时监控仅限常用目录，其余依赖每夜重扫。
               </p>
               <p>
-                来源证据：下载器任务记录、Zone.Identifier、浏览器下载库、IM 接收目录、Shell 打开记录。
-                Windows 另提供 ETW 与 Restart Manager 进程归因；macOS / Linux 的进程级归因不可用，结论会如实降级。
+                索引范围外的文件只登记路径与元数据（不计算内容指纹）；来源证据来自下载器任务记录、
+                Zone.Identifier、浏览器下载库、IM 接收目录与 Shell 打开记录，且只回填到指纹范围目录。
+              </p>
+              <p>
+                搜索使用 {status.ftsEnabled ? "FTS5 三元分词索引" : "文件名 / 路径模糊匹配"}；
+                Windows 另提供 ETW 与 Restart Manager 进程归因，macOS / Linux 的进程级归因不可用，结论会如实降级。
               </p>
             </div>
           </div>
@@ -424,7 +455,7 @@ export default function App() {
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="按文件名或路径筛选…"
+                placeholder="搜索全盘文件名或路径…"
                 spellCheck={false}
               />
             </div>
@@ -501,8 +532,16 @@ export default function App() {
             {visibleFiles.length === 0 ? (
               <div className="empty">
                 <div className="empty-icon">◇</div>
-                <p>{status.scanState === "scanning" ? "正在建立目录基线…" : "没有匹配的文件"}</p>
-                <span>首次启动需要扫描三个目录，稍等片刻即可看到结果。</span>
+                <p>
+                  {status.scanState === "scanning" || status.scanState === "indexing"
+                    ? "正在建立全盘索引…"
+                    : "没有匹配的文件"}
+                </p>
+                <span>
+                  {status.scanTruncated
+                    ? `已达上限（${status.scanTotal.toLocaleString()} 个文件），可调高 config.ini 的 max_scan_files 后重新扫描。`
+                    : "搜索全盘文件名或路径；索引范围外的文件只登记元数据，不计算内容指纹。"}
+                </span>
               </div>
             ) : null}
             {pageCount > 1 ? (
@@ -547,8 +586,10 @@ export default function App() {
                   <span className="mono muted">
                     BLAKE3{" "}
                     {detail.file.contentHash
-                      ? `${truncateChars(detail.file.contentHash, 13)}`
-                      : "计算中"}
+                      ? truncateChars(detail.file.contentHash, 13)
+                      : detail.file.hashState === "skip"
+                        ? "未计算（索引范围外）"
+                        : "计算中"}
                   </span>
                   <span className="mono muted">证据 {detail.file.sourceEvidence || "none"}</span>
                   {detail.file.openedTs > 0 ? (

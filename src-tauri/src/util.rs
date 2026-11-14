@@ -36,6 +36,14 @@ pub fn extension_of(name: &str) -> String {
 /// Files we never want to track: Office lock files, OS bookkeeping files.
 pub fn is_noise_file(name: &str) -> bool {
     let lower = name.to_lowercase();
+    // Page/hibernation files are huge, permanently locked and change on every
+    // boot; indexing them only produces noise (exact match, not a suffix rule).
+    if matches!(
+        lower.as_str(),
+        "pagefile.sys" | "swapfile.sys" | "hiberfil.sys" | "memory.dmp"
+    ) {
+        return true;
+    }
     lower.starts_with("~$")
         || lower == "desktop.ini"
         || lower == "thumbs.db"
@@ -77,6 +85,13 @@ pub fn should_skip_dir(name: &str) -> bool {
             | "$RECYCLE.BIN"
             | "System Volume Information"
             | "AppData"
+            // Filesystem bookkeeping that appears when the walk starts at a
+            // drive/root instead of a user folder. They are not user data and
+            // some are not even readable without elevated rights.
+            | ".fseventsd"
+            | ".Spotlight-V100"
+            | ".Trashes"
+            | "lost+found"
     )
 }
 
@@ -166,4 +181,30 @@ pub fn month_bounds_ms(ts_ms: i64) -> (i64, i64, String) {
     };
     let end = days_from_civil(next_year, next_month, 1) * DAY;
     (start, end, format!("{:04}{:02}", year, month))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_system_noise_names_are_skipped() {
+        for name in [
+            "pagefile.sys",
+            "PAGEFILE.SYS",
+            "swapfile.sys",
+            "hiberfil.sys",
+            "memory.dmp",
+        ] {
+            assert!(is_noise_file(name), "{name} should be noise");
+        }
+        assert!(!is_noise_file("my-pagefile.sys"));
+    }
+
+    #[test]
+    fn root_level_bookkeeping_dirs_are_skipped() {
+        for name in [".fseventsd", ".Spotlight-V100", ".Trashes", "lost+found"] {
+            assert!(should_skip_dir(name), "{name} should be skipped");
+        }
+    }
 }

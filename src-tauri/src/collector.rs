@@ -14,18 +14,28 @@ use crate::db::{FileObservation, SourceInfo, Store};
 use crate::etw::{self, EtwIndex, EtwStart};
 use crate::fingerprint::{digest_file, HashError, MAX_HASH_BYTES};
 use crate::model::Status;
+use crate::platform;
 use crate::recent::Recent;
 use crate::sources::{classify_path, refine_with_process, resolve, Sources};
 use crate::util::{is_noise_file, now_ms, should_skip_dir};
 
-const SCAN_BATCH: usize = 400;
+/// 0.4.0: a full-disk index needs bigger batches, a deeper walk and a
+/// configurable cap. `MAX_SCAN_FILES_DEFAULT` matches `Config::max_scan_files`.
+const SCAN_BATCH: usize = 2_000;
+const MAX_SCAN_DEPTH: usize = 32;
+const MAX_SCAN_FILES_DEFAULT: i64 = 1_000_000;
+/// The status cache is invalidated at most once per 20k registered files;
+/// doing it per batch made the 5 s TTL meaningless during the first scan.
+const STATS_EVERY: i64 = 20_000;
 const HASH_BATCH: i64 = 32;
 const DEBOUNCE: Duration = Duration::from_millis(400);
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// How long an ETW observation stays authoritative for a path.
 const ETW_FRESH_MS: i64 = 15_000;
 const MAX_PENDING: usize = 8_000;
-const MAX_SCAN_FILES: i64 = 200_000;
+/// Nightly convergence: one incremental walk + `exists()` sweep per 24 h.
+const RESWEEP_INTERVAL_MS: i64 = 86_400_000;
+const GONE_BATCH: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChangeKind {
@@ -60,7 +70,10 @@ impl Pending {
 pub struct Collector {
     pub store: Arc<Store>,
     pub status: Arc<Mutex<Status>>,
+    /// Hot dirs: fingerprints + real-time events.
     pub dirs: Vec<PathBuf>,
+    /// Roots the background indexer walks (fixed drives or `/`).
+    index_roots: Vec<PathBuf>,
     sources: Mutex<Sources>,
     recent: Mutex<Recent>,
     etw: Arc<EtwIndex>,
@@ -74,12 +87,14 @@ impl Collector {
         store: Arc<Store>,
         status: Arc<Mutex<Status>>,
         dirs: Vec<PathBuf>,
+        index_roots: Vec<PathBuf>,
         config: Config,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
             status,
             dirs,
+            index_roots,
             sources: Mutex::new(Sources::default()),
             recent: Mutex::new(Recent::default()),
             etw: EtwIndex::new(),
@@ -168,8 +183,13 @@ impl Collector {
     pub fn rescan(self: &Arc<Self>) {
         let me = Arc::clone(self);
         if let Err(error) = std::thread::Builder::new()
-            .name("fl-scanner".into())
+            .name("fl-indexer".into())
             .spawn(move || {
+                // v3 databases registered every file as `settling`. Now that
+                // the index covers the whole disk, only hot-dir rows may enter
+                // the hash queue. Running it on this thread (not the Tauri
+                // setup thread) keeps a million-row UPDATE off startup.
+                me.store.rescope_legacy_hot(&me.dirs);
                 me.reload_sources();
                 me.scan_once();
                 me.recent_backfill();
@@ -291,38 +311,82 @@ impl Collector {
 
     // ---------------------------------------------------------------- scan
 
-    fn scan_once(&self) {
-        self.update(|s| {
-            s.scan_state = "scanning".into();
-            s.scan_done = 0;
-            // An upfront total is impossible without walking twice; showing
-            // "0/…" for the whole scan was misleading, so the label is
-            // "已处理 N" and the total equals the processed count.
-            s.scan_total = 0;
-        });
+    /// Is this path inside the fingerprint / real-time (hot) scope?
+    fn is_hot(&self, path: &Path) -> bool {
+        self.dirs.iter().any(|dir| path.starts_with(dir))
+    }
 
-        let mut batch: Vec<(FileObservation, SourceInfo)> = Vec::with_capacity(SCAN_BATCH);
+    /// Flush one scope's batch in a single transaction. Errors go to both the
+    /// status bar and startup.log — a silently half-indexed disk is worse than
+    /// a visible warning.
+    fn flush_batch(&self, batch: &mut Vec<(FileObservation, SourceInfo)>, scope: &str) -> i64 {
+        if batch.is_empty() {
+            return 0;
+        }
+        let n = batch.len() as i64;
+        if let Err(error) = self.store.register_batch_scoped(batch, scope) {
+            let message = format!("索引写入失败（{} 区）：{}", scope, error);
+            crate::startup::log(&message);
+            self.update(|s| s.last_error = Some(message));
+        }
+        batch.clear();
+        n
+    }
+
+    /// Walk every index root once. `announce` distinguishes the startup pass
+    /// (drives the UI progress state) from the nightly incremental resweep
+    /// (same work, quiet). Returns `true` when `max_scan_files` was reached;
+    /// the caller keeps that flag in the ready state so the UI can say so.
+    fn walk_index(&self, announce: bool) -> bool {
+        if announce {
+            self.update(|s| {
+                s.scan_state = "indexing".into();
+                s.index_state = "indexing".into();
+                s.scan_done = 0;
+                s.scan_total = 0;
+                s.scan_truncated = false;
+            });
+        }
+        let max_files = self
+            .config
+            .lock()
+            .map(|c| c.max_scan_files)
+            .unwrap_or(MAX_SCAN_FILES_DEFAULT)
+            .max(1);
+        let exclusions = platform::index_exclusions();
+        let mut hot_batch: Vec<(FileObservation, SourceInfo)> = Vec::with_capacity(SCAN_BATCH);
+        let mut cold_batch: Vec<(FileObservation, SourceInfo)> = Vec::with_capacity(SCAN_BATCH);
         let mut processed: i64 = 0;
+        let mut last_invalidate: i64 = 0;
+        let mut truncated = false;
 
-        for dir in &self.dirs {
+        'roots: for root in &self.index_roots {
             if !self.running.load(Ordering::Relaxed) {
                 break;
             }
-            if !dir.is_dir() {
+            if !root.is_dir() {
                 continue;
             }
-            let walker = WalkDir::new(dir)
-                .max_depth(10)
+            let walker = WalkDir::new(root)
+                .max_depth(MAX_SCAN_DEPTH)
                 .follow_links(false)
                 .into_iter()
                 .filter_entry(|e| {
+                    if e.depth() == 0 {
+                        return true;
+                    }
                     let name = e.file_name().to_string_lossy();
-                    e.depth() == 0 || !should_skip_dir(&name)
+                    !should_skip_dir(&name)
+                        && !exclusions.iter().any(|prefix| e.path().starts_with(prefix))
                 });
 
             for entry in walker.filter_map(|e| e.ok()) {
-                if !self.running.load(Ordering::Relaxed) || processed >= MAX_SCAN_FILES {
-                    break;
+                if !self.running.load(Ordering::Relaxed) {
+                    break 'roots;
+                }
+                if processed >= max_files {
+                    truncated = true;
+                    break 'roots;
                 }
                 if !entry.file_type().is_file() {
                     continue;
@@ -334,36 +398,93 @@ impl Collector {
                 let Some(obs) = FileObservation::from_path(entry.path()) else {
                     continue;
                 };
-                let src = self.resolve_source(&obs.path, &obs.name, obs.size, None);
-                batch.push((obs, src));
-
-                if batch.len() >= SCAN_BATCH {
-                    let n = batch.len() as i64;
-                    if let Err(e) = self.store.register_batch(&batch) {
-                        self.update(|s| s.last_error = Some(format!("扫描写入失败：{}", e)));
+                if self.is_hot(entry.path()) {
+                    let src = self.resolve_source(&obs.path, &obs.name, obs.size, None);
+                    hot_batch.push((obs, src));
+                } else {
+                    // Path-shape classification is enough for index-only rows;
+                    // running every adapter per cold file would dominate a
+                    // million-file walk for no evidentiary gain.
+                    let src = classify_path(&obs.path);
+                    cold_batch.push((obs, src));
+                }
+                if hot_batch.len() + cold_batch.len() >= SCAN_BATCH {
+                    processed += self.flush_batch(&mut hot_batch, "hot");
+                    processed += self.flush_batch(&mut cold_batch, "cold");
+                    if processed - last_invalidate >= STATS_EVERY {
+                        self.store.invalidate_stats();
+                        last_invalidate = processed;
                     }
-                    processed += n;
-                    self.store.invalidate_stats();
-                    batch.clear();
-                    let done = processed;
-                    self.update(|s| s.scan_done = done);
+                    if announce {
+                        self.update(|s| s.scan_done = processed);
+                    }
                 }
             }
         }
 
-        if !batch.is_empty() {
-            let n = batch.len() as i64;
-            if let Err(e) = self.store.register_batch(&batch) {
-                self.update(|s| s.last_error = Some(format!("扫描写入失败：{}", e)));
-            }
-            processed += n;
-        }
+        processed += self.flush_batch(&mut hot_batch, "hot");
+        processed += self.flush_batch(&mut cold_batch, "cold");
         self.store.invalidate_stats();
-        self.update(|s| {
-            s.scan_done = processed;
-            s.scan_total = processed;
-            s.scan_state = "ready".into();
-        });
+        if announce {
+            self.update(|s| {
+                s.scan_done = processed;
+                s.scan_total = processed;
+                s.scan_state = "ready".into();
+                s.index_state = "done".into();
+                // Kept in the ready state on purpose: "采集就绪" must not hide
+                // that the index stopped at the configured cap.
+                s.scan_truncated = truncated;
+            });
+        }
+        truncated
+    }
+
+    fn scan_once(&self) {
+        self.walk_index(true);
+        self.store.checkpoint();
+    }
+
+    /// Nightly convergence: re-walk the roots incrementally (the upsert is a
+    /// no-op for unchanged metadata), then mark every live DB row whose path
+    /// no longer exists. Watch events are the fast path; this is the only place
+    /// a full-disk index can converge `liveness` after a crash or overflow.
+    fn nightly_resweep(&self) {
+        self.walk_index(false);
+        self.prune_gone();
+        self.store.checkpoint();
+        self.store.invalidate_stats();
+        crate::startup::log("nightly incremental resweep finished");
+    }
+
+    fn prune_gone(&self) {
+        let mut after = 0i64;
+        let mut gone: Vec<i64> = Vec::with_capacity(GONE_BATCH);
+        loop {
+            if !self.running.load(Ordering::Relaxed) {
+                return;
+            }
+            let rows = self.store.live_paths_after(after, GONE_BATCH as i64);
+            if rows.is_empty() {
+                break;
+            }
+            for (id, path) in &rows {
+                if !Path::new(path).exists() {
+                    gone.push(*id);
+                }
+            }
+            after = rows.last().map(|(id, _)| *id).unwrap_or(after + 1);
+            if gone.len() >= GONE_BATCH {
+                if let Err(error) = self.store.mark_gone_batch(&gone) {
+                    self.report_error(&format!("批量标记消失文件失败：{}", error));
+                }
+                gone.clear();
+            }
+        }
+        if !gone.is_empty() {
+            if let Err(error) = self.store.mark_gone_batch(&gone) {
+                self.report_error(&format!("批量标记消失文件失败：{}", error));
+            }
+        }
     }
 
     /// Give already-known files their "opened" timeline by matching the shell's
@@ -426,7 +547,10 @@ impl Collector {
                 continue;
             }
             let mut ids = Vec::new();
-            if let Some(id) = self.store.id_for_path(&record.path) {
+            // Exact-path matches must be in the fingerprint scope too: the
+            // whole point of B2-6 is that a full-disk index must not attach
+            // "opened"/"downloaded" events to unrelated same-named files.
+            if let Some(id) = self.store.id_for_path_in_scope(&record.path) {
                 ids.push(id);
             }
             if ids.is_empty() {
@@ -488,20 +612,39 @@ impl Collector {
             }
         };
 
+        let (watch_targets, mut scope) = platform::watch_roots(&self.dirs, &self.index_roots);
         let mut watched = 0usize;
-        for dir in &self.dirs {
+        for dir in &watch_targets {
             if watcher.watch(dir, RecursiveMode::Recursive).is_ok() {
                 watched += 1;
             }
         }
+        if watched == 0 && !self.dirs.is_empty() {
+            // A full-volume watch can be refused (FSEvents permission, inotify
+            // limit). Falling back to the hot dirs keeps lineage alive, and the
+            // scope text must say so instead of claiming whole-disk coverage.
+            for dir in &self.dirs {
+                if watcher.watch(dir, RecursiveMode::Recursive).is_ok() {
+                    watched += 1;
+                }
+            }
+            scope = "仅指纹范围目录（全盘 watch 启动失败，其余依赖每夜重扫）".to_string();
+        }
         self.update(|s| {
             s.watching = watched > 0;
+            s.watch_scope = scope.clone();
             if watched == 0 {
                 s.last_error = Some("没有可监控的目录".into());
             }
         });
 
+        let exclusions = platform::index_exclusions();
+        let is_excluded = |p: &Path| exclusions.iter().any(|prefix| p.starts_with(prefix));
+        // Hot paths keep the full probe → event → settle pipeline. Cold paths
+        // only refresh the index row, so a whole-volume watch does not turn
+        // `RmGetList` into a hot loop on every `npm install` (B2-7).
         let mut pending: HashMap<PathBuf, Pending> = HashMap::new();
+        let mut cold_pending: HashMap<PathBuf, ChangeKind> = HashMap::new();
         let mut probes: HashMap<PathBuf, Attribution> = HashMap::new();
         let mut last_probe: HashMap<PathBuf, Instant> = HashMap::new();
         let mut quiet_since: Option<Instant> = None;
@@ -522,37 +665,63 @@ impl Collector {
                     if kind == ChangeKind::Renamed && event.paths.len() >= 2 {
                         let old = event.paths[0].clone();
                         let new = event.paths[1].clone();
-                        pending.insert(old.clone(), Pending::new(ChangeKind::Removed, None));
-                        pending.insert(
-                            new.clone(),
-                            Pending::new(
-                                ChangeKind::Renamed,
-                                Some(format!("由 {} 重命名而来", old.display())),
-                            ),
-                        );
-                        self.probe(&new, &mut probes, &mut last_probe);
+                        for (path, change) in [
+                            (old.clone(), ChangeKind::Removed),
+                            (new, ChangeKind::Renamed),
+                        ] {
+                            if is_excluded(&path) {
+                                continue;
+                            }
+                            if self.is_hot(&path) {
+                                let note = if change == ChangeKind::Renamed {
+                                    Some(format!("由 {} 重命名而来", old.display()))
+                                } else {
+                                    None
+                                };
+                                pending.insert(path.clone(), Pending::new(change, note));
+                                if change != ChangeKind::Removed {
+                                    self.probe(&path, &mut probes, &mut last_probe);
+                                }
+                            } else {
+                                cold_pending.insert(path, change);
+                            }
+                        }
                         quiet_since = Some(Instant::now());
                         continue;
                     }
 
                     let mut force_flush = false;
                     for path in &event.paths {
-                        if pending.len() >= MAX_PENDING {
+                        if is_excluded(path) {
+                            continue;
+                        }
+                        if pending.len() + cold_pending.len() >= MAX_PENDING {
                             // Back-pressure: do not wait for a quiet window
-                            // when the pending map is already full.
+                            // when the pending maps are already full.
                             force_flush = true;
                             break;
                         }
-                        let entry = pending
-                            .entry(path.clone())
-                            .or_insert_with(|| Pending::new(kind, None));
-                        // "created" is strictly more informative than a later
-                        // "modified" in the same burst, so never downgrade it.
-                        if entry.kind == ChangeKind::Modified && kind == ChangeKind::Created {
-                            entry.kind = ChangeKind::Created;
-                        }
-                        if kind != ChangeKind::Removed {
-                            self.probe(path, &mut probes, &mut last_probe);
+                        if self.is_hot(path) {
+                            let entry = pending
+                                .entry(path.clone())
+                                .or_insert_with(|| Pending::new(kind, None));
+                            // "created" is strictly more informative than a
+                            // later "modified" in the same burst, so never
+                            // downgrade it.
+                            if entry.kind == ChangeKind::Modified && kind == ChangeKind::Created {
+                                entry.kind = ChangeKind::Created;
+                            }
+                            if kind != ChangeKind::Removed {
+                                self.probe(path, &mut probes, &mut last_probe);
+                            }
+                        } else {
+                            let keep_removal = cold_pending
+                                .get(path)
+                                .is_some_and(|existing| *existing == ChangeKind::Removed)
+                                && kind != ChangeKind::Removed;
+                            if !keep_removal {
+                                cold_pending.insert(path.clone(), kind);
+                            }
                         }
                     }
                     quiet_since = Some(if force_flush {
@@ -568,11 +737,15 @@ impl Collector {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
 
-            if !pending.is_empty()
+            if (!pending.is_empty() || !cold_pending.is_empty())
                 && quiet_since
                     .map(|t| t.elapsed() >= DEBOUNCE)
                     .unwrap_or(false)
             {
+                let cold_items: Vec<(PathBuf, ChangeKind)> = cold_pending.drain().collect();
+                for (path, change) in cold_items {
+                    self.apply_cold_change(&path, change);
+                }
                 let items: Vec<(PathBuf, Pending)> = pending.drain().collect();
                 for (path, change) in items {
                     let probe = probes.remove(&path);
@@ -588,6 +761,31 @@ impl Collector {
 
         drop(watcher);
         self.update(|s| s.watching = false);
+    }
+
+    /// Cold zone: index-only. No Restart Manager probe, no `final_probe`, no
+    /// events and no "opened" backfill. Deletions still need `mark_gone` so the
+    /// list does not keep showing a file that no longer exists.
+    fn apply_cold_change(&self, path: &Path, kind: ChangeKind) {
+        let key = path.to_string_lossy().to_string();
+        if kind == ChangeKind::Removed {
+            if let Err(error) = self.store.mark_gone(&key) {
+                self.report_error(&format!("标记文件消失失败：{}", error));
+            }
+            return;
+        }
+        let Some(obs) = FileObservation::from_path(path) else {
+            return;
+        };
+        if is_noise_file(&obs.name) {
+            return;
+        }
+        if let Err(error) = self
+            .store
+            .upsert_file_scoped(&obs, &classify_path(&obs.path), "cold")
+        {
+            self.report_error(&format!("写入索引记录失败：{}", error));
+        }
     }
 
     fn apply_change(
@@ -606,7 +804,7 @@ impl Collector {
                     now_ms(),
                     0,
                     None,
-                    Some("文件已从监控目录中消失"),
+                    Some("文件已从指纹范围目录中消失"),
                 ) {
                     self.report_error(&format!("记录删除事件失败：{}", error));
                 }
@@ -794,7 +992,9 @@ impl Collector {
                 continue;
             }
             self.update(|s| {
-                if s.scan_state != "scanning" {
+                // An indexing pass is still a scan: the hash thread must not
+                // flip the label to "hashing" (or "ready") while it runs.
+                if s.scan_state != "scanning" && s.scan_state != "indexing" {
                     s.scan_state = "hashing".into();
                 }
             });
@@ -859,7 +1059,8 @@ impl Collector {
     // ---------------------------------------------------------- maintenance
 
     fn maintenance_loop(&self) {
-        // Let the initial scan finish before competing for the database.
+        // The startup index owns the disk for its first pass; let it finish
+        // before maintenance competes for the database.
         for _ in 0..6 {
             if !self.running.load(Ordering::Relaxed) {
                 return;
@@ -867,6 +1068,10 @@ impl Collector {
             std::thread::sleep(Duration::from_secs(30));
         }
 
+        // A resident daemon crosses a night every 24 h; that is the only
+        // reliable convergence point for `liveness` on cold zones and after a
+        // watch buffer overflow (B2-12).
+        let mut last_resweep = now_ms();
         loop {
             if !self.running.load(Ordering::Relaxed) {
                 return;
@@ -883,6 +1088,12 @@ impl Collector {
                 }
                 Ok(_) => {}
                 Err(e) => self.update(|s| s.last_error = Some(format!("归档失败：{}", e))),
+            }
+
+            let since = now_ms();
+            if since - last_resweep >= RESWEEP_INTERVAL_MS {
+                last_resweep = since;
+                self.nightly_resweep();
             }
 
             for _ in 0..60 {
